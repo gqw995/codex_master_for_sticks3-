@@ -1,0 +1,16 @@
+.DS_Store
+.venv/
+.pio/
+__pycache__/
+*.py[cod]
+*.log
+.env
+.env.*
+
+# Local build history and packaging workspaces.
+dist/
+release/
+CodeX Master.zip
+
+# Separate project stored beside CodeX Master.
+CS2_Item_Simulator/

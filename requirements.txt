@@ -1,0 +1,3 @@
+platformio==6.1.18
+pyserial==3.5
+intelhex==2.3.0
