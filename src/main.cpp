@@ -5,6 +5,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <math.h>
 
 namespace {
 
@@ -22,6 +23,14 @@ constexpr uint16_t kUsagePort = 47322;
 constexpr uint32_t kUsbPriorityMs = 30000;
 constexpr uint32_t kWifiRetryMs = 30000;
 constexpr uint32_t kRefreshTimeoutMs = 60000;
+constexpr uint32_t kScreenTimeoutMs = 10000;
+constexpr uint32_t kBatteryPollMs = 15000;
+constexpr uint32_t kImuSampleMs = 25;
+constexpr uint32_t kShakeWindowMs = 500;
+constexpr uint32_t kShakeCooldownMs = 3500;
+constexpr float kShakeDeltaG = 0.85f;
+constexpr uint8_t kShakePeaksRequired = 2;
+constexpr uint8_t kDisplayBrightness = 100;
 constexpr char kPortalPassword[] = "codecmaster";
 constexpr uint8_t kMaxRadarModels = 12;
 
@@ -79,8 +88,24 @@ bool provisioningScreen = false;
 bool lastWifiConnected = false;
 uint32_t sidePressedAt = 0;
 bool sideLongHandled = false;
+bool sideWakeOnly = false;
 uint32_t frontPressedAt = 0;
 bool frontLongHandled = false;
+bool frontWakeOnly = false;
+bool screenAwake = true;
+uint32_t lastButtonActivityMillis = 0;
+int cachedBatteryLevel = -1;
+uint32_t batteryReadMillis = 0;
+bool batteryLevelInitialized = false;
+bool imuAvailable = false;
+bool haveAccelSample = false;
+float previousAccelX = 0.0f;
+float previousAccelY = 0.0f;
+float previousAccelZ = 0.0f;
+uint8_t shakePeakCount = 0;
+uint32_t shakeWindowStartedMillis = 0;
+uint32_t lastShakeRefreshMillis = 0;
+uint32_t lastImuSampleMillis = 0;
 
 uint32_t colorForRemaining(int value) {
   if (value >= 50) return kGreen;
@@ -165,6 +190,41 @@ void drawProgressBar(int x, int y, int width, int height, int percent, uint32_t 
   }
 }
 
+int batteryLevel() {
+  const uint32_t now = millis();
+  if (!batteryLevelInitialized || now - batteryReadMillis >= kBatteryPollMs) {
+    const int level = M5.Power.getBatteryLevel();
+    cachedBatteryLevel = level < 0 ? -1 : constrain(level, 0, 100);
+    batteryReadMillis = now;
+    batteryLevelInitialized = true;
+  }
+  return cachedBatteryLevel;
+}
+
+void drawHeader(const String& title, uint32_t titleColor) {
+  const int level = batteryLevel();
+  const uint32_t batteryColor = level < 0 ? kMuted : colorForRemaining(level);
+  const String levelText = level < 0 ? "--%" : String(level) + "%";
+
+  M5.Display.setTextSize(1.0f, 1.0f);
+  M5.Display.setTextFont(1);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(titleColor, kBackground);
+  M5.Display.drawString(title, 8, 8);
+
+  M5.Display.setTextColor(batteryColor, kBackground);
+  M5.Display.setTextDatum(top_right);
+  const int textRight = M5.Display.width() - 5;
+  const int iconX = textRight - M5.Display.textWidth(levelText) - 19;
+  M5.Display.drawRect(iconX, 8, 13, 8, batteryColor);
+  M5.Display.fillRect(iconX + 13, 10, 2, 4, batteryColor);
+  if (level > 0) {
+    const int fillWidth = max(1, 9 * level / 100);
+    M5.Display.fillRect(iconX + 2, 10, fillWidth, 4, batteryColor);
+  }
+  M5.Display.drawString(levelText, textRight, 7);
+}
+
 String refreshFooterText(const String& idleHint) {
   if (refreshState == RefreshState::Pending) return "REFRESHING...";
   if (refreshState == RefreshState::Success) return "REFRESH OK";
@@ -190,10 +250,8 @@ void drawFooter(const String& hint, const String& primary = "") {
 }
 
 void drawCodexScreen() {
+  drawHeader("CODEX", kBlue);
   M5.Display.setTextDatum(top_center);
-  M5.Display.setTextColor(kBlue, kBackground);
-  M5.Display.setTextFont(2);
-  M5.Display.drawString("CODEX", M5.Display.width() / 2, 8);
   M5.Display.setTextColor(kMuted, kBackground);
   M5.Display.setTextFont(1);
   M5.Display.drawString("WEEK LEFT", M5.Display.width() / 2, 29);
@@ -234,10 +292,7 @@ void drawRangeTabs() {
 
 void drawVibeScreen() {
   const PeriodUsage& selected = usage.periods[static_cast<int>(currentRange)];
-  M5.Display.setTextDatum(top_center);
-  M5.Display.setTextColor(kPurple, kBackground);
-  M5.Display.setTextFont(2);
-  M5.Display.drawString("VIBE USAGE", M5.Display.width() / 2, 8);
+  drawHeader("VIBE USAGE", kPurple);
   drawRangeTabs();
 
   M5.Display.setTextDatum(top_left);
@@ -272,10 +327,7 @@ void drawRadarScreen() {
   const uint8_t pageCount = radarPageCount();
   if (currentRadarPage >= pageCount) currentRadarPage = 0;
 
-  M5.Display.setTextDatum(top_center);
-  M5.Display.setTextColor(kAmber, kBackground);
-  M5.Display.setTextFont(2);
-  M5.Display.drawString("CODEX RADAR", M5.Display.width() / 2, 7);
+  drawHeader("CODEX RADAR", kAmber);
 
   if (usage.radarCount == 0) {
     M5.Display.fillRoundRect(10, 56, M5.Display.width() - 20, 100, 9, kPanel);
@@ -312,10 +364,9 @@ void drawRadarScreen() {
 
 void drawProvisioningScreen() {
   const bool connected = WiFi.status() == WL_CONNECTED;
+  drawHeader("WI-FI SETUP", kBlue);
   M5.Display.setTextDatum(top_center);
   M5.Display.setTextFont(2);
-  M5.Display.setTextColor(kBlue, kBackground);
-  M5.Display.drawString("WI-FI SETUP", M5.Display.width() / 2, 9);
 
   if (connected) {
     M5.Display.fillRoundRect(10, 48, M5.Display.width() - 20, 105, 10, kPanel);
@@ -356,6 +407,7 @@ void drawProvisioningScreen() {
 }
 
 void drawScreen() {
+  if (!screenAwake) return;
   M5.Display.startWrite();
   M5.Display.fillScreen(kBackground);
   if (provisioningScreen) drawProvisioningScreen();
@@ -363,6 +415,30 @@ void drawScreen() {
   else if (currentPage == ScreenPage::Vibe) drawVibeScreen();
   else drawRadarScreen();
   M5.Display.endWrite();
+}
+
+void wakeScreen() {
+  if (screenAwake) return;
+  screenAwake = true;
+  haveAccelSample = false;
+  shakePeakCount = 0;
+  M5.Display.wakeup();
+  M5.Display.setBrightness(kDisplayBrightness);
+  drawScreen();
+  Serial.println("STICKS3_SCREEN,ON");
+}
+
+void sleepScreen() {
+  if (!screenAwake) return;
+  screenAwake = false;
+  haveAccelSample = false;
+  shakePeakCount = 0;
+  M5.Display.sleep();
+  Serial.println("STICKS3_SCREEN,OFF");
+}
+
+void serviceScreenTimeout() {
+  if (screenAwake && millis() - lastButtonActivityMillis >= kScreenTimeoutMs) sleepScreen();
 }
 
 void saveUiState() {
@@ -494,6 +570,49 @@ void requestRefresh() {
   refreshStateMillis = millis();
   Serial.println("STICKS3_REFRESH");
   drawScreen();
+}
+
+void serviceShakeRefresh() {
+  if (!screenAwake || provisioningScreen || !imuAvailable) return;
+  const uint32_t now = millis();
+  if (now - lastImuSampleMillis < kImuSampleMs) return;
+  lastImuSampleMillis = now;
+  if (!M5.Imu.update()) return;
+
+  const auto data = M5.Imu.getImuData();
+  const float x = data.accel.x;
+  const float y = data.accel.y;
+  const float z = data.accel.z;
+  if (!haveAccelSample) {
+    previousAccelX = x;
+    previousAccelY = y;
+    previousAccelZ = z;
+    haveAccelSample = true;
+    return;
+  }
+
+  const float dx = x - previousAccelX;
+  const float dy = y - previousAccelY;
+  const float dz = z - previousAccelZ;
+  previousAccelX = x;
+  previousAccelY = y;
+  previousAccelZ = z;
+
+  if (now - shakeWindowStartedMillis > kShakeWindowMs) shakePeakCount = 0;
+  const bool shakePeak = dx * dx + dy * dy + dz * dz >= kShakeDeltaG * kShakeDeltaG;
+  if (!shakePeak) return;
+
+  if (shakePeakCount == 0) shakeWindowStartedMillis = now;
+  ++shakePeakCount;
+  if (shakePeakCount < kShakePeaksRequired ||
+      now - lastShakeRefreshMillis < kShakeCooldownMs ||
+      refreshState == RefreshState::Pending) return;
+
+  shakePeakCount = 0;
+  lastShakeRefreshMillis = now;
+  lastButtonActivityMillis = now;
+  Serial.println("STICKS3_SHAKE_REFRESH");
+  requestRefresh();
 }
 
 bool applyUsageLine(const String& line, DataSource incomingSource) {
@@ -654,12 +773,27 @@ void serviceWifi() {
 }
 
 void handleButtons() {
+  const uint32_t now = millis();
   if (M5.BtnB.wasPressed()) {
-    sidePressedAt = millis();
+    sideWakeOnly = !screenAwake;
+    lastButtonActivityMillis = now;
+    wakeScreen();
+    sidePressedAt = sideWakeOnly ? 0 : now;
     sideLongHandled = false;
   }
-  if (M5.BtnB.isPressed() && sidePressedAt != 0 && !sideLongHandled &&
-      millis() - sidePressedAt >= 1200) {
+  if (M5.BtnA.wasPressed()) {
+    frontWakeOnly = !screenAwake;
+    lastButtonActivityMillis = now;
+    wakeScreen();
+    frontPressedAt = frontWakeOnly ? 0 : now;
+    frontLongHandled = false;
+  }
+  if (screenAwake && (M5.BtnA.isPressed() || M5.BtnB.isPressed())) {
+    lastButtonActivityMillis = now;
+  }
+
+  if (!sideWakeOnly && M5.BtnB.isPressed() && sidePressedAt != 0 && !sideLongHandled &&
+      now - sidePressedAt >= 1200) {
     sideLongHandled = true;
     provisioningScreen = true;
     if (WiFi.status() == WL_CONNECTED) stopPortal();
@@ -667,7 +801,7 @@ void handleButtons() {
     drawScreen();
   }
   if (M5.BtnB.wasReleased()) {
-    if (!sideLongHandled) {
+    if (!sideWakeOnly && !sideLongHandled) {
       if (provisioningScreen) {
         provisioningScreen = false;
         stopPortal();
@@ -680,20 +814,24 @@ void handleButtons() {
     }
     sidePressedAt = 0;
     sideLongHandled = false;
+    sideWakeOnly = false;
   }
 
-  if (provisioningScreen) return;
-  if (M5.BtnA.wasPressed()) {
-    frontPressedAt = millis();
-    frontLongHandled = false;
+  if (provisioningScreen) {
+    if (M5.BtnA.wasReleased()) {
+      frontPressedAt = 0;
+      frontLongHandled = false;
+      frontWakeOnly = false;
+    }
+    return;
   }
-  if (M5.BtnA.isPressed() && frontPressedAt != 0 && !frontLongHandled &&
-      millis() - frontPressedAt >= 1200) {
+  if (!frontWakeOnly && M5.BtnA.isPressed() && frontPressedAt != 0 && !frontLongHandled &&
+      now - frontPressedAt >= 1200) {
     frontLongHandled = true;
     requestRefresh();
   }
   if (M5.BtnA.wasReleased()) {
-    if (!frontLongHandled) {
+    if (!frontWakeOnly && !frontLongHandled) {
       if (currentPage == ScreenPage::Vibe) {
         currentRange = static_cast<TimeRange>((static_cast<int>(currentRange) + 1) % 3);
         saveUiState();
@@ -706,6 +844,7 @@ void handleButtons() {
     }
     frontPressedAt = 0;
     frontLongHandled = false;
+    frontWakeOnly = false;
   }
 }
 
@@ -720,13 +859,17 @@ void setup() {
   config.serial_baudrate = 115200;
   M5.begin(config);
   M5.Display.setRotation(0);
-  M5.Display.setBrightness(100);
+  M5.Display.setBrightness(kDisplayBrightness);
+  imuAvailable = M5.Imu.getType() != m5::imu_none;
   loadState();
+  lastButtonActivityMillis = millis();
   drawScreen();
 
   if (savedSsid.isEmpty()) startPortal();
   else connectWifi();
   Serial.println("STICKS3_READY");
+  Serial.printf("STICKS3_STATUS,BOARD=%d,IMU=%d,BAT=%d\n", static_cast<int>(M5.getBoard()),
+                static_cast<int>(M5.Imu.getType()), batteryLevel());
 }
 
 void loop() {
@@ -734,6 +877,8 @@ void loop() {
   readSerial();
   serviceWifi();
   handleButtons();
+  serviceShakeRefresh();
+  serviceScreenTimeout();
 
   if (refreshState == RefreshState::Pending && millis() - refreshStateMillis >= kRefreshTimeoutMs) {
     refreshState = RefreshState::Failed;
@@ -748,8 +893,9 @@ void loop() {
   static uint32_t lastHeartbeat = 0;
   if (millis() - lastHeartbeat >= 2000) {
     lastHeartbeat = millis();
-    Serial.printf("STICKS3_ALIVE,%d,%d,%s\n", M5.Display.width(), M5.Display.height(),
-                  preferredHost.c_str());
+    Serial.printf("STICKS3_ALIVE,%d,%d,%s,SCREEN=%d,IMU=%d,BAT=%d\n", M5.Display.width(),
+                  M5.Display.height(), preferredHost.c_str(), screenAwake,
+                  static_cast<int>(M5.Imu.getType()), batteryLevel());
   }
 
   static uint32_t lastMinuteDraw = 0;
