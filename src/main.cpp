@@ -5,7 +5,8 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
-#include <math.h>
+#include <esp_sleep.h>
+#include <time.h>
 
 namespace {
 
@@ -23,14 +24,14 @@ constexpr uint16_t kUsagePort = 47322;
 constexpr uint32_t kUsbPriorityMs = 30000;
 constexpr uint32_t kWifiRetryMs = 30000;
 constexpr uint32_t kRefreshTimeoutMs = 60000;
-constexpr uint32_t kScreenTimeoutMs = 10000;
+constexpr uint32_t kScreenTimeoutMs = 15000;
 constexpr uint32_t kBatteryPollMs = 15000;
-constexpr uint32_t kImuSampleMs = 25;
-constexpr uint32_t kShakeWindowMs = 500;
-constexpr uint32_t kShakeCooldownMs = 3500;
-constexpr float kShakeDeltaG = 0.85f;
-constexpr uint8_t kShakePeaksRequired = 2;
-constexpr uint8_t kDisplayBrightness = 100;
+constexpr uint32_t kAutoRefreshDelayMs = 1500;
+constexpr int64_t kTimezoneOffsetSeconds = 8 * 60 * 60;
+constexpr uint8_t kDisplayBrightness = 80;
+constexpr gpio_num_t kFrontButtonPin = GPIO_NUM_11;
+constexpr gpio_num_t kSideButtonPin = GPIO_NUM_12;
+constexpr uint64_t kButtonWakeMask = (1ULL << kFrontButtonPin) | (1ULL << kSideButtonPin);
 constexpr char kPortalPassword[] = "codecmaster";
 constexpr uint8_t kMaxRadarModels = 12;
 
@@ -88,24 +89,16 @@ bool provisioningScreen = false;
 bool lastWifiConnected = false;
 uint32_t sidePressedAt = 0;
 bool sideLongHandled = false;
-bool sideWakeOnly = false;
 uint32_t frontPressedAt = 0;
 bool frontLongHandled = false;
-bool frontWakeOnly = false;
 bool screenAwake = true;
+bool ignoreButtonsUntilReleased = false;
+bool autoRefreshPending = false;
+uint32_t autoRefreshStartedMillis = 0;
 uint32_t lastButtonActivityMillis = 0;
 int cachedBatteryLevel = -1;
 uint32_t batteryReadMillis = 0;
 bool batteryLevelInitialized = false;
-bool imuAvailable = false;
-bool haveAccelSample = false;
-float previousAccelX = 0.0f;
-float previousAccelY = 0.0f;
-float previousAccelZ = 0.0f;
-uint8_t shakePeakCount = 0;
-uint32_t shakeWindowStartedMillis = 0;
-uint32_t lastShakeRefreshMillis = 0;
-uint32_t lastImuSampleMillis = 0;
 
 uint32_t colorForRemaining(int value) {
   if (value >= 50) return kGreen;
@@ -154,6 +147,16 @@ String formatRadarScore(int16_t tenths) {
   if (tenths < 0) return "--";
   char buffer[12];
   snprintf(buffer, sizeof(buffer), "%d.%d", tenths / 10, abs(tenths % 10));
+  return String(buffer);
+}
+
+String formatUpdateTime(int64_t epoch) {
+  if (epoch <= 0) return "--";
+  const time_t localEpoch = static_cast<time_t>(epoch + kTimezoneOffsetSeconds);
+  struct tm value;
+  if (gmtime_r(&localEpoch, &value) == nullptr) return "--";
+  char buffer[16];
+  strftime(buffer, sizeof(buffer), "%m/%d %H:%M", &value);
   return String(buffer);
 }
 
@@ -225,11 +228,12 @@ void drawHeader(const String& title, uint32_t titleColor) {
   M5.Display.drawString(levelText, textRight, 7);
 }
 
-String refreshFooterText(const String& idleHint) {
+String refreshFooterText() {
   if (refreshState == RefreshState::Pending) return "REFRESHING...";
   if (refreshState == RefreshState::Success) return "REFRESH OK";
   if (refreshState == RefreshState::Failed) return "REFRESH FAILED";
-  return idleHint;
+  if (dataSource == DataSource::Cache) return "SAVED DATA";
+  return sourceText() + " CONNECTED";
 }
 
 uint32_t refreshFooterColor() {
@@ -239,14 +243,21 @@ uint32_t refreshFooterColor() {
   return kMuted;
 }
 
-void drawFooter(const String& hint, const String& primary = "") {
+void drawFooter(const String& radarUpdated = "") {
   M5.Display.setTextDatum(bottom_center);
   M5.Display.setTextFont(1);
-  const String connection = dataSource == DataSource::Cache ? "SAVED DATA" : sourceText() + " CONNECTED";
-  M5.Display.setTextColor(primary.isEmpty() && dataSource != DataSource::Cache ? kGreen : kMuted, kBackground);
-  M5.Display.drawString(primary.isEmpty() ? connection : primary, M5.Display.width() / 2, 222);
+  if (!radarUpdated.isEmpty()) {
+    M5.Display.setTextColor(kMuted, kBackground);
+    M5.Display.drawString("RADAR " + radarUpdated, M5.Display.width() / 2, 207);
+  }
+  M5.Display.setTextColor(kMuted, kBackground);
+  M5.Display.drawString("UPDATED " + formatUpdateTime(usage.fetchedEpoch),
+                        M5.Display.width() / 2, 222);
   M5.Display.setTextColor(refreshFooterColor(), kBackground);
-  M5.Display.drawString(refreshFooterText(hint), M5.Display.width() / 2, 237);
+  if (refreshState == RefreshState::Idle && dataSource != DataSource::Cache) {
+    M5.Display.setTextColor(kGreen, kBackground);
+  }
+  M5.Display.drawString(refreshFooterText(), M5.Display.width() / 2, 237);
 }
 
 void drawCodexScreen() {
@@ -274,7 +285,7 @@ void drawCodexScreen() {
   M5.Display.setTextColor(kWhite, kPanel);
   M5.Display.setTextFont(2);
   M5.Display.drawString(countdownText(), 20, 160);
-  drawFooter("Hold front: refresh");
+  drawFooter();
 }
 
 void drawRangeTabs() {
@@ -316,7 +327,7 @@ void drawVibeScreen() {
   M5.Display.setTextColor(kGreen, kPanel);
   M5.Display.setTextFont(4);
   M5.Display.drawString(formatTokens(selected.totalTokens), 20, 151);
-  drawFooter("Tap period | Hold sync");
+  drawFooter();
 }
 
 uint8_t radarPageCount() {
@@ -358,8 +369,7 @@ void drawRadarScreen() {
                             M5.Display.width() / 2, y + 30);
     }
   }
-  const String updated = usage.radarUpdated.isEmpty() ? "UPDATED --" : "UPDATED " + usage.radarUpdated;
-  drawFooter("Tap next | Hold refresh", updated);
+  drawFooter(usage.radarUpdated.isEmpty() ? "--" : usage.radarUpdated);
 }
 
 void drawProvisioningScreen() {
@@ -417,24 +427,16 @@ void drawScreen() {
   M5.Display.endWrite();
 }
 
-void wakeScreen() {
-  if (screenAwake) return;
-  screenAwake = true;
-  haveAccelSample = false;
-  shakePeakCount = 0;
-  M5.Display.wakeup();
-  M5.Display.setBrightness(kDisplayBrightness);
-  drawScreen();
-  Serial.println("STICKS3_SCREEN,ON");
-}
-
 void sleepScreen() {
   if (!screenAwake) return;
   screenAwake = false;
-  haveAccelSample = false;
-  shakePeakCount = 0;
-  M5.Display.sleep();
   Serial.println("STICKS3_SCREEN,OFF");
+  Serial.flush();
+  WiFi.mode(WIFI_OFF);
+  M5.Display.sleep();
+  M5.Display.waitDisplay();
+  esp_sleep_enable_ext1_wakeup(kButtonWakeMask, ESP_EXT1_WAKEUP_ANY_LOW);
+  esp_deep_sleep_start();
 }
 
 void serviceScreenTimeout() {
@@ -570,49 +572,6 @@ void requestRefresh() {
   refreshStateMillis = millis();
   Serial.println("STICKS3_REFRESH");
   drawScreen();
-}
-
-void serviceShakeRefresh() {
-  if (!screenAwake || provisioningScreen || !imuAvailable) return;
-  const uint32_t now = millis();
-  if (now - lastImuSampleMillis < kImuSampleMs) return;
-  lastImuSampleMillis = now;
-  if (!M5.Imu.update()) return;
-
-  const auto data = M5.Imu.getImuData();
-  const float x = data.accel.x;
-  const float y = data.accel.y;
-  const float z = data.accel.z;
-  if (!haveAccelSample) {
-    previousAccelX = x;
-    previousAccelY = y;
-    previousAccelZ = z;
-    haveAccelSample = true;
-    return;
-  }
-
-  const float dx = x - previousAccelX;
-  const float dy = y - previousAccelY;
-  const float dz = z - previousAccelZ;
-  previousAccelX = x;
-  previousAccelY = y;
-  previousAccelZ = z;
-
-  if (now - shakeWindowStartedMillis > kShakeWindowMs) shakePeakCount = 0;
-  const bool shakePeak = dx * dx + dy * dy + dz * dz >= kShakeDeltaG * kShakeDeltaG;
-  if (!shakePeak) return;
-
-  if (shakePeakCount == 0) shakeWindowStartedMillis = now;
-  ++shakePeakCount;
-  if (shakePeakCount < kShakePeaksRequired ||
-      now - lastShakeRefreshMillis < kShakeCooldownMs ||
-      refreshState == RefreshState::Pending) return;
-
-  shakePeakCount = 0;
-  lastShakeRefreshMillis = now;
-  lastButtonActivityMillis = now;
-  Serial.println("STICKS3_SHAKE_REFRESH");
-  requestRefresh();
 }
 
 bool applyUsageLine(const String& line, DataSource incomingSource) {
@@ -774,25 +733,29 @@ void serviceWifi() {
 
 void handleButtons() {
   const uint32_t now = millis();
-  if (M5.BtnB.wasPressed()) {
-    sideWakeOnly = !screenAwake;
+  if (ignoreButtonsUntilReleased) {
     lastButtonActivityMillis = now;
-    wakeScreen();
-    sidePressedAt = sideWakeOnly ? 0 : now;
+    if (digitalRead(kFrontButtonPin) == HIGH && digitalRead(kSideButtonPin) == HIGH) {
+      ignoreButtonsUntilReleased = false;
+    }
+    return;
+  }
+
+  if (M5.BtnB.wasPressed()) {
+    lastButtonActivityMillis = now;
+    sidePressedAt = now;
     sideLongHandled = false;
   }
   if (M5.BtnA.wasPressed()) {
-    frontWakeOnly = !screenAwake;
     lastButtonActivityMillis = now;
-    wakeScreen();
-    frontPressedAt = frontWakeOnly ? 0 : now;
+    frontPressedAt = now;
     frontLongHandled = false;
   }
-  if (screenAwake && (M5.BtnA.isPressed() || M5.BtnB.isPressed())) {
+  if (M5.BtnA.isPressed() || M5.BtnB.isPressed()) {
     lastButtonActivityMillis = now;
   }
 
-  if (!sideWakeOnly && M5.BtnB.isPressed() && sidePressedAt != 0 && !sideLongHandled &&
+  if (M5.BtnB.isPressed() && sidePressedAt != 0 && !sideLongHandled &&
       now - sidePressedAt >= 1200) {
     sideLongHandled = true;
     provisioningScreen = true;
@@ -801,7 +764,7 @@ void handleButtons() {
     drawScreen();
   }
   if (M5.BtnB.wasReleased()) {
-    if (!sideWakeOnly && !sideLongHandled) {
+    if (!sideLongHandled) {
       if (provisioningScreen) {
         provisioningScreen = false;
         stopPortal();
@@ -814,24 +777,22 @@ void handleButtons() {
     }
     sidePressedAt = 0;
     sideLongHandled = false;
-    sideWakeOnly = false;
   }
 
   if (provisioningScreen) {
     if (M5.BtnA.wasReleased()) {
       frontPressedAt = 0;
       frontLongHandled = false;
-      frontWakeOnly = false;
     }
     return;
   }
-  if (!frontWakeOnly && M5.BtnA.isPressed() && frontPressedAt != 0 && !frontLongHandled &&
+  if (M5.BtnA.isPressed() && frontPressedAt != 0 && !frontLongHandled &&
       now - frontPressedAt >= 1200) {
     frontLongHandled = true;
     requestRefresh();
   }
   if (M5.BtnA.wasReleased()) {
-    if (!frontWakeOnly && !frontLongHandled) {
+    if (!frontLongHandled) {
       if (currentPage == ScreenPage::Vibe) {
         currentRange = static_cast<TimeRange>((static_cast<int>(currentRange) + 1) % 3);
         saveUiState();
@@ -844,7 +805,6 @@ void handleButtons() {
     }
     frontPressedAt = 0;
     frontLongHandled = false;
-    frontWakeOnly = false;
   }
 }
 
@@ -855,21 +815,27 @@ void setup() {
   // HW CDC default 256-byte RX queue. Allocate this before M5.begin() calls
   // Serial.begin(), otherwise the tail (including the newline) can be lost.
   Serial.setRxBufferSize(1024);
+  const bool wokeByButton = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1;
   auto config = M5.config();
   config.serial_baudrate = 115200;
+  config.internal_imu = false;
+  config.internal_mic = false;
+  config.internal_spk = false;
   M5.begin(config);
   M5.Display.setRotation(0);
   M5.Display.setBrightness(kDisplayBrightness);
-  imuAvailable = M5.Imu.getType() != m5::imu_none;
   loadState();
+  ignoreButtonsUntilReleased = wokeByButton;
+  autoRefreshPending = wokeByButton;
+  autoRefreshStartedMillis = millis();
   lastButtonActivityMillis = millis();
   drawScreen();
 
   if (savedSsid.isEmpty()) startPortal();
   else connectWifi();
   Serial.println("STICKS3_READY");
-  Serial.printf("STICKS3_STATUS,BOARD=%d,IMU=%d,BAT=%d\n", static_cast<int>(M5.getBoard()),
-                static_cast<int>(M5.Imu.getType()), batteryLevel());
+  Serial.printf("STICKS3_STATUS,BOARD=%d,BAT=%d,WAKE=%d\n", static_cast<int>(M5.getBoard()),
+                batteryLevel(), wokeByButton);
 }
 
 void loop() {
@@ -877,7 +843,10 @@ void loop() {
   readSerial();
   serviceWifi();
   handleButtons();
-  serviceShakeRefresh();
+  if (autoRefreshPending && millis() - autoRefreshStartedMillis >= kAutoRefreshDelayMs) {
+    autoRefreshPending = false;
+    requestRefresh();
+  }
   serviceScreenTimeout();
 
   if (refreshState == RefreshState::Pending && millis() - refreshStateMillis >= kRefreshTimeoutMs) {
@@ -893,9 +862,8 @@ void loop() {
   static uint32_t lastHeartbeat = 0;
   if (millis() - lastHeartbeat >= 2000) {
     lastHeartbeat = millis();
-    Serial.printf("STICKS3_ALIVE,%d,%d,%s,SCREEN=%d,IMU=%d,BAT=%d\n", M5.Display.width(),
-                  M5.Display.height(), preferredHost.c_str(), screenAwake,
-                  static_cast<int>(M5.Imu.getType()), batteryLevel());
+    Serial.printf("STICKS3_ALIVE,%d,%d,%s,SCREEN=%d,BAT=%d\n", M5.Display.width(),
+                  M5.Display.height(), preferredHost.c_str(), screenAwake, batteryLevel());
   }
 
   static uint32_t lastMinuteDraw = 0;

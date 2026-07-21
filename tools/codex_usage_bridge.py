@@ -140,6 +140,7 @@ class UsbHotplugManager:
         self.explicit_port = explicit_port
         self.device: PosixSerialDevice | None = None
         self.identified = False
+        self.screen_awake = True
         self.opened_at = 0.0
         self.last_scan = 0.0
         self.last_send = 0.0
@@ -197,9 +198,15 @@ class UsbHotplugManager:
         try:
             for line in self.device.read_lines():
                 if line.startswith(("STICKS3_READY", "STICKS3_ALIVE", "CODEX_READY", "CODEX_ALIVE")):
+                    self.screen_awake = True
                     if not self.identified:
                         self.identified = True
                         print(f"Stick S3 identified on {self.path}", flush=True)
+                elif line == "STICKS3_SCREEN,OFF":
+                    self.screen_awake = False
+                    print("Stick S3 entered low-power sleep", flush=True)
+                elif line == "STICKS3_SCREEN,ON":
+                    self.screen_awake = True
                 elif line in ("STICKS3_REFRESH", "CODEX_REFRESH"):
                     refresh_requested = True
                 elif line == "STICKS3_REFRESH_DONE":
@@ -220,7 +227,7 @@ class UsbHotplugManager:
             if self.identified and refresh_requested:
                 self.device.write_line("STICKS3_REFRESH_ACK")
                 print("Stick S3 refresh request acknowledged", flush=True)
-            if self.identified and payload:
+            if self.identified and self.screen_awake and payload:
                 changed = payload != self.last_payload
                 heartbeat_due = now - self.last_send >= 30.0
                 if changed or heartbeat_due or refresh_requested:
@@ -585,13 +592,14 @@ def main() -> int:
                     print(f"Metrics collection failed: {result}", flush=True)
 
             refresh_requested = usb.tick(payload) if usb else False
-            if (now >= next_poll or refresh_requested) and not (
+            device_sleeping = bool(usb and not usb.screen_awake)
+            if not device_sleeping and (now >= next_poll or refresh_requested) and not (
                 collection_thread and collection_thread.is_alive()
             ):
                 start_collection(snapshot)
                 next_poll = now + max(30, args.interval)
 
-            if wifi and payload and now >= next_wifi:
+            if not device_sleeping and wifi and payload and now >= next_wifi:
                 try:
                     wifi.send(payload)
                 except OSError as error:
