@@ -27,6 +27,7 @@ constexpr uint32_t kRefreshTimeoutMs = 60000;
 constexpr uint32_t kScreenTimeoutMs = 15000;
 constexpr uint32_t kBatteryPollMs = 15000;
 constexpr uint32_t kAutoRefreshDelayMs = 1500;
+constexpr uint32_t kWifiControlRetryMs = 1000;
 constexpr int64_t kTimezoneOffsetSeconds = 8 * 60 * 60;
 constexpr uint8_t kDisplayBrightness = 80;
 constexpr gpio_num_t kFrontButtonPin = GPIO_NUM_11;
@@ -99,6 +100,7 @@ uint32_t lastButtonActivityMillis = 0;
 int cachedBatteryLevel = -1;
 uint32_t batteryReadMillis = 0;
 bool batteryLevelInitialized = false;
+uint32_t lastWifiRefreshRequestMillis = 0;
 
 uint32_t colorForRemaining(int value) {
   if (value >= 50) return kGreen;
@@ -427,11 +429,39 @@ void drawScreen() {
   M5.Display.endWrite();
 }
 
+bool sendWifiControl(const String& event) {
+  if (!udpRunning || WiFi.status() != WL_CONNECTED) return false;
+  String message = event;
+  if (!preferredHost.isEmpty()) message += "," + preferredHost;
+
+  bool delivered = false;
+  const IPAddress globalBroadcast(255, 255, 255, 255);
+  if (usageUdp.beginPacket(globalBroadcast, kUsagePort)) {
+    usageUdp.print(message);
+    delivered = usageUdp.endPacket() == 1;
+  }
+
+  IPAddress subnetBroadcast = WiFi.localIP();
+  const IPAddress subnetMask = WiFi.subnetMask();
+  bool differsFromGlobal = false;
+  for (int i = 0; i < 4; ++i) {
+    subnetBroadcast[i] = subnetBroadcast[i] | static_cast<uint8_t>(~subnetMask[i]);
+    differsFromGlobal = differsFromGlobal || subnetBroadcast[i] != 255;
+  }
+  if (differsFromGlobal && usageUdp.beginPacket(subnetBroadcast, kUsagePort)) {
+    usageUdp.print(message);
+    delivered = usageUdp.endPacket() == 1 || delivered;
+  }
+  return delivered;
+}
+
 void sleepScreen() {
   if (!screenAwake) return;
   screenAwake = false;
   Serial.println("STICKS3_SCREEN,OFF");
   Serial.flush();
+  sendWifiControl("STICKS3_SCREEN_OFF");
+  delay(20);
   WiFi.mode(WIFI_OFF);
   M5.Display.sleep();
   M5.Display.waitDisplay();
@@ -568,9 +598,13 @@ bool parseUsageLine(const String& line, UsageSnapshot& parsed) {
 }
 
 void requestRefresh() {
+  const uint32_t now = millis();
   refreshState = RefreshState::Pending;
-  refreshStateMillis = millis();
+  refreshStateMillis = now;
+  lastButtonActivityMillis = now;
+  lastWifiRefreshRequestMillis = 0;
   Serial.println("STICKS3_REFRESH");
+  if (sendWifiControl("STICKS3_REFRESH")) lastWifiRefreshRequestMillis = now;
   drawScreen();
 }
 
@@ -597,6 +631,7 @@ bool applyUsageLine(const String& line, DataSource incomingSource) {
   if (refreshCompleted) {
     refreshState = RefreshState::Success;
     refreshStateMillis = now;
+    lastButtonActivityMillis = now;
   }
   if (changed || refreshCompleted) {
     if (changed) saveSnapshot();
@@ -615,6 +650,7 @@ void readSerial() {
         if (refreshState == RefreshState::Pending) {
           refreshState = RefreshState::Success;
           refreshStateMillis = millis();
+          lastButtonActivityMillis = refreshStateMillis;
           drawScreen();
           Serial.println("STICKS3_REFRESH_DONE");
         }
@@ -704,6 +740,7 @@ void serviceWifi() {
     if (!udpRunning) {
       usageUdp.begin(kUsagePort);
       udpRunning = true;
+      sendWifiControl("STICKS3_SCREEN_ON");
     }
   } else {
     udpRunning = false;
@@ -728,6 +765,13 @@ void serviceWifi() {
       applyUsageLine(line, DataSource::Wifi);
     }
     packetSize = usageUdp.parsePacket();
+  }
+
+  const uint32_t now = millis();
+  if (refreshState == RefreshState::Pending &&
+      now - lastWifiRefreshRequestMillis >= kWifiControlRetryMs &&
+      sendWifiControl("STICKS3_REFRESH")) {
+    lastWifiRefreshRequestMillis = now;
   }
 }
 

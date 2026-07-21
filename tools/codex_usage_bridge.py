@@ -36,6 +36,10 @@ WIFI_BROADCAST_PORT = 47322
 PROTOCOL_PREFIX = "USAGE3"
 
 
+def safe_host_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "-", value)[:28] or "Mac"
+
+
 @dataclass(frozen=True)
 class PeriodUsage:
     cost_cents: int = -1
@@ -67,7 +71,7 @@ class UsageSnapshot:
     radar: RadarUsage = RadarUsage()
 
     def wire_payload(self) -> str:
-        safe_host = re.sub(r"[^A-Za-z0-9_.-]", "-", self.host)[:28] or "Mac"
+        safe_host = safe_host_name(self.host)
         fields = [
             PROTOCOL_PREFIX,
             safe_host,
@@ -249,8 +253,13 @@ class WifiBroadcaster:
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        self.socket.bind(("", port))
+        self.socket.setblocking(False)
         self._targets: list[str] = []
         self._targets_updated = 0.0
+        self.screen_awake: bool | None = None
 
     def _broadcast_targets(self) -> list[str]:
         now = time.monotonic()
@@ -280,6 +289,32 @@ class WifiBroadcaster:
                 errors.append(error)
         if not delivered and errors:
             raise errors[-1]
+
+    def poll(self, expected_host: str = "") -> bool:
+        refresh_requested = False
+        safe_expected_host = safe_host_name(expected_host) if expected_host else ""
+        while True:
+            try:
+                data, _ = self.socket.recvfrom(1024)
+            except BlockingIOError:
+                break
+            line = data.decode("ascii", errors="ignore").strip()
+            event, separator, target_host = line.partition(",")
+            if event not in ("STICKS3_REFRESH", "STICKS3_SCREEN_ON", "STICKS3_SCREEN_OFF"):
+                continue
+            if separator and target_host and safe_expected_host and target_host != safe_expected_host:
+                continue
+            if event == "STICKS3_SCREEN_OFF":
+                if self.screen_awake is not False:
+                    print("Stick S3 entered low-power sleep over Wi-Fi", flush=True)
+                self.screen_awake = False
+            else:
+                self.screen_awake = True
+                if event == "STICKS3_REFRESH":
+                    if not refresh_requested:
+                        print("Stick S3 wireless refresh request received", flush=True)
+                    refresh_requested = True
+        return refresh_requested
 
     def close(self) -> None:
         self.socket.close()
@@ -588,11 +623,19 @@ def main() -> int:
                 if completed:
                     snapshot = result
                     payload = snapshot.wire_payload()
+                    next_wifi = 0.0
                 else:
                     print(f"Metrics collection failed: {result}", flush=True)
 
-            refresh_requested = usb.tick(payload) if usb else False
-            device_sleeping = bool(usb and not usb.screen_awake)
+            usb_refresh_requested = usb.tick(payload) if usb else False
+            wifi_refresh_requested = wifi.poll(snapshot.host if snapshot else "") if wifi else False
+            refresh_requested = usb_refresh_requested or wifi_refresh_requested
+            if wifi_refresh_requested:
+                next_wifi = 0.0
+            if wifi and wifi.screen_awake is not None:
+                device_sleeping = not wifi.screen_awake
+            else:
+                device_sleeping = bool(usb and not usb.screen_awake)
             if not device_sleeping and (now >= next_poll or refresh_requested) and not (
                 collection_thread and collection_thread.is_alive()
             ):
