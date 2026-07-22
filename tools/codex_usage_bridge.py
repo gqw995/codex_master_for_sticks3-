@@ -25,6 +25,7 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,7 @@ from typing import Any
 DEFAULT_CODEX = "/Applications/ChatGPT.app/Contents/Resources/codex"
 DEFAULT_VIBE_API = "https://vibecafe.ai"
 CODEX_RADAR_URL = "https://codexradar.com/"
+CODEX_RADAR_DATA_URL = "https://codexradar.com/data/intelligence-efficiency.json"
 WIFI_BROADCAST_PORT = 47322
 PROTOCOL_PREFIX = "USAGE3"
 
@@ -464,6 +466,48 @@ class MetricsCollector:
 
     @staticmethod
     def _read_codex_radar() -> RadarUsage:
+        data_error: Exception | None = None
+        try:
+            request = urllib.request.Request(
+                CODEX_RADAR_DATA_URL,
+                headers={"User-Agent": "StickS3-Usage-Bridge/3.0"},
+                method="GET",
+            )
+            with urllib.request.urlopen(request, timeout=25) as response:
+                data = json.load(response)
+
+            source_updated_at = str(data.get("source_updated_at") or "")
+            updated_at = datetime.fromisoformat(source_updated_at.replace("Z", "+00:00"))
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            updated_at = updated_at.astimezone(timezone(timedelta(hours=8)))
+
+            model_names = {
+                "gpt-5.6-sol": "Sol",
+                "gpt-5.6-terra": "Terra",
+                "gpt-5.6-luna": "Luna",
+                "gpt-5.5": "5.5",
+            }
+            models: list[RadarModel] = []
+            for point in data.get("points") or []:
+                model_id = str(point.get("model") or "").strip()
+                effort = str(point.get("effort") or "").strip()
+                iq = point.get("iq")
+                if not model_id or not effort or iq is None:
+                    continue
+                model_name = model_names.get(model_id)
+                if not model_name:
+                    model_name = model_id.removeprefix("gpt-").replace("-", " ").title()
+                models.append(
+                    RadarModel(name=f"{model_name} {effort}", score_tenths=round(float(iq) * 10))
+                )
+            if not models:
+                raise RuntimeError("Codex Radar model scores were not found")
+            models.sort(key=lambda model: (-model.score_tenths, model.name.lower()))
+            return RadarUsage(updated=updated_at.strftime("%m/%d %H:%M"), models=tuple(models[:12]))
+        except Exception as error:
+            data_error = error
+
         request = urllib.request.Request(
             CODEX_RADAR_URL,
             headers={"User-Agent": "StickS3-Usage-Bridge/3.0"},
@@ -478,24 +522,24 @@ class MetricsCollector:
             flags=re.DOTALL,
         )
         if not section_match:
-            raise RuntimeError("Codex Radar score section was not found")
+            raise RuntimeError(
+                f"Codex Radar data endpoint failed ({data_error}); legacy score section was not found"
+            ) from data_error
         section = section_match.group(0)
-
         updated_match = re.search(
             r'<h2>\s*降智雷达\s*<span>(\d{1,2})月(\d{1,2})日(\d{1,2}):(\d{2})更新</span>',
             section,
         )
-        if not updated_match:
-            raise RuntimeError("Codex Radar update time was not found")
-        month, day, hour, minute = (int(value) for value in updated_match.groups())
-        updated = f"{month:02d}/{day:02d} {hour:02d}:{minute:02d}"
-
         card_pattern = re.compile(
             r'class="model-iq-score-chip[^\"]*"[^>]*>\s*'
             r'<span>([^<]+)</span>\s*'
             r'<div\s+class="model-iq-score-metrics"><strong>([0-9]+(?:\.[0-9]+)?)</strong>',
             flags=re.DOTALL,
         )
+        if not updated_match:
+            raise RuntimeError("Codex Radar update time was not found")
+        month, day, hour, minute = (int(value) for value in updated_match.groups())
+        updated = f"{month:02d}/{day:02d} {hour:02d}:{minute:02d}"
         models: list[RadarModel] = []
         for raw_name, raw_score in card_pattern.findall(section):
             name = " ".join(html.unescape(raw_name).split())

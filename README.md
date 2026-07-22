@@ -4,7 +4,7 @@ CodeX Master 是运行在 M5Stack StickS3 上的个人 AI 编程用量显示器�
 
 - Codex 一周剩余额度和重置倒计时。
 - Vibe Usage 的 24 小时、7 天、30 天预估费用和总 Token。
-- Codex 雷达“降智雷达”的模型最新分数和网站更新时间。
+- Codex 雷达“智力效率”的模型最新分数和网站更新时间。
 - USB 热插拔、Wi-Fi 备用连接和多台 Mac 自动切换。
 - 右上角设备电量、80% 亮度和统一的数据更新时间。
 - 15 秒无按键后进入低功耗睡眠，按键唤醒后通过 USB 或 Wi-Fi 自动刷新。
@@ -31,4 +31,4 @@ CodeX Master/
 
 - Codex：本机 Codex app-server 的只读额度接口。
 - Vibe Usage：本机现有 Vibe Usage 配置对应的统计接口。
-- Codex 雷达：[codexradar.com](https://codexradar.com/) 返回的结构化 HTML；不使用截图或 OCR。
+- Codex 雷达：[codexradar.com](https://codexradar.com/) 的“智力效率”结构化数据接口；不使用截图或 OCR。
