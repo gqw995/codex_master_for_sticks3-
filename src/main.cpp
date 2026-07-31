@@ -25,7 +25,7 @@ constexpr uint32_t kUsbPriorityMs = 30000;
 constexpr uint32_t kWifiRetryMs = 30000;
 constexpr uint32_t kRefreshTimeoutMs = 60000;
 constexpr uint32_t kScreenTimeoutMs = 15000;
-constexpr uint32_t kBatteryPollMs = 15000;
+constexpr uint32_t kBatteryPollMs = 2000;
 constexpr uint32_t kAutoRefreshDelayMs = 1500;
 constexpr uint32_t kWifiControlRetryMs = 1000;
 constexpr int64_t kTimezoneOffsetSeconds = 8 * 60 * 60;
@@ -63,6 +63,12 @@ struct UsageSnapshot {
   RadarModel radarModels[kMaxRadarModels];
 };
 
+struct BatteryStatus {
+  int level = -1;
+  int voltage = -1;
+  bool charging = false;
+};
+
 Preferences prefs;
 UsageSnapshot usage;
 ScreenPage currentPage = ScreenPage::Codex;
@@ -97,7 +103,7 @@ bool ignoreButtonsUntilReleased = false;
 bool autoRefreshPending = false;
 uint32_t autoRefreshStartedMillis = 0;
 uint32_t lastButtonActivityMillis = 0;
-int cachedBatteryLevel = -1;
+BatteryStatus cachedBattery;
 uint32_t batteryReadMillis = 0;
 bool batteryLevelInitialized = false;
 uint32_t lastWifiRefreshRequestMillis = 0;
@@ -195,21 +201,31 @@ void drawProgressBar(int x, int y, int width, int height, int percent, uint32_t 
   }
 }
 
-int batteryLevel() {
+bool updateBatteryStatus() {
   const uint32_t now = millis();
-  if (!batteryLevelInitialized || now - batteryReadMillis >= kBatteryPollMs) {
-    const int level = M5.Power.getBatteryLevel();
-    cachedBatteryLevel = level < 0 ? -1 : constrain(level, 0, 100);
-    batteryReadMillis = now;
-    batteryLevelInitialized = true;
-  }
-  return cachedBatteryLevel;
+  if (batteryLevelInitialized && now - batteryReadMillis < kBatteryPollMs) return false;
+
+  BatteryStatus next;
+  next.charging = M5.Power.isCharging();
+  const int level = M5.Power.getBatteryLevel();
+  next.level = level < 0 ? -1 : constrain(level, 0, 100);
+  const int voltage = M5.Power.getBatteryVoltage();
+  next.voltage = voltage <= 0 ? -1 : voltage;
+
+  const bool changed = !batteryLevelInitialized || next.level != cachedBattery.level ||
+                       next.voltage != cachedBattery.voltage || next.charging != cachedBattery.charging;
+  cachedBattery = next;
+  batteryReadMillis = now;
+  batteryLevelInitialized = true;
+  return changed;
 }
 
 void drawHeader(const String& title, uint32_t titleColor) {
-  const int level = batteryLevel();
+  updateBatteryStatus();
+  const int level = cachedBattery.level;
   const uint32_t batteryColor = level < 0 ? kMuted : colorForRemaining(level);
   const String levelText = level < 0 ? "--%" : String(level) + "%";
+  const String voltageText = cachedBattery.voltage < 0 ? "--mV" : String(cachedBattery.voltage) + "mV";
 
   M5.Display.setTextSize(1.0f, 1.0f);
   M5.Display.setTextFont(1);
@@ -228,6 +244,10 @@ void drawHeader(const String& title, uint32_t titleColor) {
     M5.Display.fillRect(iconX + 2, 10, fillWidth, 4, batteryColor);
   }
   M5.Display.drawString(levelText, textRight, 7);
+
+  M5.Display.setTextColor(kMuted, kBackground);
+  M5.Display.drawString(String("CHARGING: ") + (cachedBattery.charging ? "YES " : "NO ") + voltageText,
+                        textRight, 18);
 }
 
 String refreshFooterText() {
@@ -878,15 +898,18 @@ void setup() {
   if (savedSsid.isEmpty()) startPortal();
   else connectWifi();
   Serial.println("STICKS3_READY");
-  Serial.printf("STICKS3_STATUS,BOARD=%d,BAT=%d,WAKE=%d\n", static_cast<int>(M5.getBoard()),
-                batteryLevel(), wokeByButton);
+  Serial.printf("STICKS3_STATUS,BOARD=%d,BAT=%d,WAKE=%d,BAT_MV=%d,CHG=%d\n",
+                static_cast<int>(M5.getBoard()), cachedBattery.level, wokeByButton,
+                cachedBattery.voltage, cachedBattery.charging);
 }
 
 void loop() {
   M5.update();
+  const bool batteryChanged = updateBatteryStatus();
   readSerial();
   serviceWifi();
   handleButtons();
+  if (batteryChanged) drawScreen();
   if (autoRefreshPending && millis() - autoRefreshStartedMillis >= kAutoRefreshDelayMs) {
     autoRefreshPending = false;
     requestRefresh();
@@ -906,8 +929,9 @@ void loop() {
   static uint32_t lastHeartbeat = 0;
   if (millis() - lastHeartbeat >= 2000) {
     lastHeartbeat = millis();
-    Serial.printf("STICKS3_ALIVE,%d,%d,%s,SCREEN=%d,BAT=%d\n", M5.Display.width(),
-                  M5.Display.height(), preferredHost.c_str(), screenAwake, batteryLevel());
+    Serial.printf("STICKS3_ALIVE,%d,%d,%s,SCREEN=%d,BAT=%d,BAT_MV=%d,CHG=%d\n",
+                  M5.Display.width(), M5.Display.height(), preferredHost.c_str(), screenAwake,
+                  cachedBattery.level, cachedBattery.voltage, cachedBattery.charging);
   }
 
   static uint32_t lastMinuteDraw = 0;
