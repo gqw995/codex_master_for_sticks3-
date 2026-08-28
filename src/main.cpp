@@ -268,7 +268,9 @@ void drawQuotaCard(int y, const String& label, int remaining, int64_t resetEpoch
   M5.Display.setTextFont(1);
   M5.Display.setTextColor(kMuted, kPanel);
   M5.Display.drawString(label + " LEFT", M5.Display.width() / 2, y + 5);
-  M5.Display.drawString("RESET IN " + countdownText(resetEpoch), M5.Display.width() / 2, y + 16);
+  const String resetText =
+      remaining >= 100 && resetEpoch <= 0 ? "READY" : "RESET IN " + countdownText(resetEpoch);
+  M5.Display.drawString(resetText, M5.Display.width() / 2, y + 16);
 
   M5.Display.setTextFont(4);
   M5.Display.setTextColor(accent, kPanel);

@@ -430,7 +430,10 @@ class CodexAppServer:
         if five_hour is not None:
             five_hour_used = max(0, min(100, int(five_hour.get("usedPercent") or 0)))
             five_hour_remaining = 100 - five_hour_used
-            five_hour_reset_epoch = int(five_hour.get("resetsAt") or 0)
+            # An unused 5-hour window has not started yet. Codex reports
+            # resetsAt as "now + 5h" in that state, so it is not a countdown.
+            if five_hour_used > 0:
+                five_hour_reset_epoch = int(five_hour.get("resetsAt") or 0)
 
         return (
             100 - weekly_used,

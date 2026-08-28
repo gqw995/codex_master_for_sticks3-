@@ -121,6 +121,32 @@ class CodexRateLimitTests(unittest.TestCase):
 
         self.assertEqual(limits, (98, 2, 1788483429, 75, 1787897794))
 
+    def test_unused_five_hour_window_has_no_reset_countdown(self) -> None:
+        result = {
+            "rateLimits": {
+                "primary": {
+                    "usedPercent": 4,
+                    "windowDurationMins": 10080,
+                    "resetsAt": 1788483429,
+                },
+                "secondary": None,
+            },
+            "rateLimitsByLimitId": {
+                "codex_bengalfox": {
+                    "primary": {
+                        "usedPercent": 0,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1787899925,
+                    },
+                    "secondary": None,
+                },
+            },
+        }
+
+        limits = codex_usage_bridge.CodexAppServer._parse_rate_limits(result)
+
+        self.assertEqual(limits, (96, 4, 1788483429, 100, 0))
+
     def test_usage4_payload_appends_five_hour_window_after_radar_models(self) -> None:
         snapshot = codex_usage_bridge.UsageSnapshot(
             host="Test Mac",
