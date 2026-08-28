@@ -54,6 +54,8 @@ struct RadarModel {
 struct UsageSnapshot {
   String host;
   int64_t fetchedEpoch = 0;
+  int16_t quota5hRemaining = -1;
+  int64_t quota5hResetEpoch = 0;
   int16_t quotaRemaining = -1;
   int16_t quotaUsed = -1;
   int64_t quotaResetEpoch = 0;
@@ -162,10 +164,10 @@ String formatUpdateTime(int64_t epoch) {
   return String(buffer);
 }
 
-String countdownText() {
-  if (usage.quotaResetEpoch <= 0 || usage.fetchedEpoch <= 0) return "--";
+String countdownText(int64_t resetEpoch) {
+  if (resetEpoch <= 0 || usage.fetchedEpoch <= 0) return "--";
   const int64_t elapsed = static_cast<int64_t>((millis() - snapshotMillis) / 1000);
-  int64_t seconds = usage.quotaResetEpoch - usage.fetchedEpoch - elapsed;
+  int64_t seconds = resetEpoch - usage.fetchedEpoch - elapsed;
   if (seconds < 0) seconds = 0;
   const int64_t days = seconds / 86400;
   const int64_t hours = (seconds % 86400) / 3600;
@@ -217,12 +219,12 @@ void drawHeader(const String& title, uint32_t titleColor) {
   M5.Display.drawString(title, 8, 8);
 
   M5.Display.setTextColor(batteryColor, kBackground);
-  const int iconX = M5.Display.width() - 20;
-  M5.Display.drawRect(iconX, 8, 13, 8, batteryColor);
-  M5.Display.fillRect(iconX + 13, 10, 2, 4, batteryColor);
-  if (level > 0) {
-    const int fillWidth = max(1, 9 * level / 100);
-    M5.Display.fillRect(iconX + 2, 10, fillWidth, 4, batteryColor);
+  const int iconX = M5.Display.width() - 22;
+  M5.Display.drawRect(iconX, 7, 18, 10, batteryColor);
+  M5.Display.fillRect(iconX + 18, 10, 2, 4, batteryColor);
+  const int segmentCount = level <= 0 ? 0 : min(4, (level + 24) / 25);
+  for (int segment = 0; segment < segmentCount; ++segment) {
+    M5.Display.fillRect(iconX + 2 + segment * 4, 9, 3, 6, batteryColor);
   }
 }
 
@@ -258,31 +260,29 @@ void drawFooter(const String& radarUpdated = "") {
   M5.Display.drawString(refreshFooterText(), M5.Display.width() / 2, 237);
 }
 
-void drawCodexScreen() {
-  drawHeader("CODEX", kBlue);
-  M5.Display.setTextDatum(top_center);
-  M5.Display.setTextColor(kMuted, kBackground);
-  M5.Display.setTextFont(1);
-  M5.Display.drawString("WEEK LEFT", M5.Display.width() / 2, 29);
+void drawQuotaCard(int y, const String& label, int remaining, int64_t resetEpoch) {
+  const uint32_t accent = remaining < 0 ? kMuted : colorForRemaining(remaining);
+  M5.Display.fillRoundRect(8, y, M5.Display.width() - 16, 73, 9, kPanel);
 
-  const uint32_t accent = usage.quotaRemaining < 0 ? kMuted : colorForRemaining(usage.quotaRemaining);
-  M5.Display.setTextColor(accent, kBackground);
-  M5.Display.setTextFont(7);
-  const String percent = usage.quotaRemaining < 0 ? "--" : String(usage.quotaRemaining);
-  M5.Display.drawString(percent, M5.Display.width() / 2 - 7, 44);
-  M5.Display.setTextFont(2);
-  M5.Display.setTextDatum(top_left);
-  M5.Display.drawString("%", M5.Display.width() - 29, 72);
-  drawProgressBar(14, 108, M5.Display.width() - 28, 14, max(0, static_cast<int>(usage.quotaRemaining)), accent);
-
-  M5.Display.fillRoundRect(10, 135, M5.Display.width() - 20, 54, 9, kPanel);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextFont(1);
   M5.Display.setTextColor(kMuted, kPanel);
-  M5.Display.drawString("RESETS IN", 20, 145);
-  M5.Display.setTextColor(kWhite, kPanel);
-  M5.Display.setTextFont(2);
-  M5.Display.drawString(countdownText(), 20, 160);
+  M5.Display.drawString(label + " LEFT", 16, y + 7);
+  M5.Display.setTextDatum(top_right);
+  M5.Display.drawString("RESET " + countdownText(resetEpoch), M5.Display.width() - 16, y + 7);
+
+  M5.Display.setTextDatum(top_center);
+  M5.Display.setTextFont(4);
+  M5.Display.setTextColor(accent, kPanel);
+  M5.Display.drawString(remaining < 0 ? "--" : String(remaining) + "%", M5.Display.width() / 2,
+                        y + 23);
+  drawProgressBar(16, y + 57, M5.Display.width() - 32, 8, max(0, remaining), accent);
+}
+
+void drawCodexScreen() {
+  drawHeader("CODEX", kBlue);
+  drawQuotaCard(27, "5H", usage.quota5hRemaining, usage.quota5hResetEpoch);
+  drawQuotaCard(106, "7D", usage.quotaRemaining, usage.quotaResetEpoch);
   drawFooter();
 }
 
@@ -481,6 +481,8 @@ void saveSnapshot() {
   prefs.begin("usage-data", false);
   prefs.putString("host", usage.host);
   prefs.putLong64("fetched", usage.fetchedEpoch);
+  prefs.putInt("remain5h", usage.quota5hRemaining);
+  prefs.putLong64("reset5h", usage.quota5hResetEpoch);
   prefs.putInt("remain", usage.quotaRemaining);
   prefs.putInt("used", usage.quotaUsed);
   prefs.putLong64("reset", usage.quotaResetEpoch);
@@ -508,6 +510,8 @@ void loadState() {
   prefs.begin("usage-data", false);
   usage.host = prefs.getString("host", "");
   usage.fetchedEpoch = prefs.getLong64("fetched", 0);
+  usage.quota5hRemaining = prefs.getInt("remain5h", -1);
+  usage.quota5hResetEpoch = prefs.getLong64("reset5h", 0);
   usage.quotaRemaining = prefs.getInt("remain", -1);
   usage.quotaUsed = prefs.getInt("used", -1);
   usage.quotaResetEpoch = prefs.getLong64("reset", 0);
@@ -534,6 +538,8 @@ void loadState() {
 
 bool sameSnapshot(const UsageSnapshot& left, const UsageSnapshot& right) {
   if (left.host != right.host || left.fetchedEpoch != right.fetchedEpoch ||
+      left.quota5hRemaining != right.quota5hRemaining ||
+      left.quota5hResetEpoch != right.quota5hResetEpoch ||
       left.quotaRemaining != right.quotaRemaining || left.quotaUsed != right.quotaUsed ||
       left.quotaResetEpoch != right.quotaResetEpoch) return false;
   for (int i = 0; i < 3; ++i) {
@@ -551,7 +557,8 @@ bool sameSnapshot(const UsageSnapshot& left, const UsageSnapshot& right) {
 bool parseUsageLine(const String& line, UsageSnapshot& parsed) {
   const bool isV2 = line.startsWith("USAGE2,");
   const bool isV3 = line.startsWith("USAGE3,");
-  if (!isV2 && !isV3) return false;
+  const bool isV4 = line.startsWith("USAGE4,");
+  if (!isV2 && !isV3 && !isV4) return false;
   String fields[40];
   int fieldIndex = 0;
   int start = 0;
@@ -564,6 +571,7 @@ bool parseUsageLine(const String& line, UsageSnapshot& parsed) {
   if (fieldIndex < 12 || fields[1].isEmpty()) return false;
   if (isV2 && (fieldIndex != 12 || fields[0] != "USAGE2")) return false;
   if (isV3 && (fieldIndex < 14 || fields[0] != "USAGE3")) return false;
+  if (isV4 && (fieldIndex < 16 || fields[0] != "USAGE4")) return false;
   parsed.host = fields[1];
   parsed.fetchedEpoch = strtoll(fields[2].c_str(), nullptr, 10);
   parsed.quotaRemaining = constrain(fields[3].toInt(), -1L, 100L);
@@ -574,14 +582,23 @@ bool parseUsageLine(const String& line, UsageSnapshot& parsed) {
     parsed.periods[i].totalTokens = strtoll(fields[7 + i * 2].c_str(), nullptr, 10);
   }
 
-  if (isV3) {
+  if (isV3 || isV4) {
     const int radarCount = fields[13].toInt();
-    if (radarCount < 0 || radarCount > kMaxRadarModels || fieldIndex != 14 + radarCount * 2) return false;
+    const int expectedFields = 14 + radarCount * 2 + (isV4 ? 2 : 0);
+    if (radarCount < 0 || radarCount > kMaxRadarModels || fieldIndex != expectedFields) return false;
     parsed.radarUpdated = fields[12];
     parsed.radarCount = radarCount;
     for (int i = 0; i < radarCount; ++i) {
       parsed.radarModels[i].name = fields[14 + i * 2];
       parsed.radarModels[i].scoreTenths = static_cast<int16_t>(fields[15 + i * 2].toInt());
+    }
+    if (isV4) {
+      const int quota5hIndex = 14 + radarCount * 2;
+      parsed.quota5hRemaining = constrain(fields[quota5hIndex].toInt(), -1L, 100L);
+      parsed.quota5hResetEpoch = strtoll(fields[quota5hIndex + 1].c_str(), nullptr, 10);
+    } else {
+      parsed.quota5hRemaining = usage.quota5hRemaining;
+      parsed.quota5hResetEpoch = usage.quota5hResetEpoch;
     }
   } else {
     // A Mac with the previous bridge can still update Codex/Vibe while the
@@ -589,6 +606,8 @@ bool parseUsageLine(const String& line, UsageSnapshot& parsed) {
     parsed.radarUpdated = usage.radarUpdated;
     parsed.radarCount = usage.radarCount;
     for (int i = 0; i < usage.radarCount; ++i) parsed.radarModels[i] = usage.radarModels[i];
+    parsed.quota5hRemaining = usage.quota5hRemaining;
+    parsed.quota5hResetEpoch = usage.quota5hResetEpoch;
   }
   return parsed.fetchedEpoch > 0;
 }
@@ -851,7 +870,7 @@ void handleButtons() {
 }  // namespace
 
 void setup() {
-  // A full USAGE3 payload with 12 radar models is larger than the ESP32-S3
+  // A full USAGE4 payload with 12 radar models is larger than the ESP32-S3
   // HW CDC default 256-byte RX queue. Allocate this before M5.begin() calls
   // Serial.begin(), otherwise the tail (including the newline) can be lost.
   Serial.setRxBufferSize(1024);
@@ -862,6 +881,7 @@ void setup() {
   config.internal_mic = false;
   config.internal_spk = false;
   M5.begin(config);
+  M5.Power.setBatteryCharge(true);
   M5.Display.setRotation(0);
   M5.Display.setBrightness(kDisplayBrightness);
   loadState();
@@ -874,8 +894,9 @@ void setup() {
   if (savedSsid.isEmpty()) startPortal();
   else connectWifi();
   Serial.println("STICKS3_READY");
-  Serial.printf("STICKS3_STATUS,BOARD=%d,BAT=%d,WAKE=%d\n", static_cast<int>(M5.getBoard()),
-                cachedBatteryLevel, wokeByButton);
+  Serial.printf("STICKS3_STATUS,BOARD=%d,BAT=%d,WAKE=%d,CHG=%d\n",
+                static_cast<int>(M5.getBoard()), cachedBatteryLevel, wokeByButton,
+                static_cast<int>(M5.Power.isCharging()));
 }
 
 void loop() {
@@ -902,8 +923,9 @@ void loop() {
   static uint32_t lastHeartbeat = 0;
   if (millis() - lastHeartbeat >= 2000) {
     lastHeartbeat = millis();
-    Serial.printf("STICKS3_ALIVE,%d,%d,%s,SCREEN=%d,BAT=%d\n", M5.Display.width(),
-                  M5.Display.height(), preferredHost.c_str(), screenAwake, cachedBatteryLevel);
+    Serial.printf("STICKS3_ALIVE,%d,%d,%s,SCREEN=%d,BAT=%d,CHG=%d\n", M5.Display.width(),
+                  M5.Display.height(), preferredHost.c_str(), screenAwake, cachedBatteryLevel,
+                  static_cast<int>(M5.Power.isCharging()));
   }
 
   static uint32_t lastMinuteDraw = 0;

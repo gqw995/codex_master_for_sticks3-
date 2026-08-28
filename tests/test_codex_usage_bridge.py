@@ -81,5 +81,66 @@ class CodexRadarTests(unittest.TestCase):
         )
 
 
+class CodexRateLimitTests(unittest.TestCase):
+    def test_reads_default_weekly_and_model_specific_five_hour_windows(self) -> None:
+        result = {
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {
+                    "usedPercent": 2,
+                    "windowDurationMins": 10080,
+                    "resetsAt": 1788483429,
+                },
+                "secondary": None,
+            },
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "primary": {
+                        "usedPercent": 2,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1788483429,
+                    },
+                    "secondary": None,
+                },
+                "codex_bengalfox": {
+                    "primary": {
+                        "usedPercent": 25,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1787897794,
+                    },
+                    "secondary": {
+                        "usedPercent": 10,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1788484594,
+                    },
+                },
+            },
+        }
+
+        limits = codex_usage_bridge.CodexAppServer._parse_rate_limits(result)
+
+        self.assertEqual(limits, (98, 2, 1788483429, 75, 1787897794))
+
+    def test_usage4_payload_appends_five_hour_window_after_radar_models(self) -> None:
+        snapshot = codex_usage_bridge.UsageSnapshot(
+            host="Test Mac",
+            fetched_epoch=1787890000,
+            quota_5h_remaining=75,
+            quota_5h_reset_epoch=1787897794,
+            quota_remaining=98,
+            quota_used=2,
+            quota_reset_epoch=1788483429,
+            radar=codex_usage_bridge.RadarUsage(
+                updated="08/28 09:00",
+                models=(codex_usage_bridge.RadarModel("Sol high", 912),),
+            ),
+        )
+
+        fields = snapshot.wire_payload().split(",")
+
+        self.assertEqual(fields[0], "USAGE4")
+        self.assertEqual(fields[-2:], ["75", "1787897794"])
+
+
 if __name__ == "__main__":
     unittest.main()

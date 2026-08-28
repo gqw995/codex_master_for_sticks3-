@@ -35,7 +35,7 @@ DEFAULT_VIBE_API = "https://vibecafe.ai"
 CODEX_RADAR_URL = "https://codexradar.com/"
 CODEX_RADAR_DATA_URL = "https://codexradar.com/data/intelligence-efficiency.json"
 WIFI_BROADCAST_PORT = 47322
-PROTOCOL_PREFIX = "USAGE3"
+PROTOCOL_PREFIX = "USAGE4"
 
 
 def safe_host_name(value: str) -> str:
@@ -64,6 +64,8 @@ class RadarUsage:
 class UsageSnapshot:
     host: str
     fetched_epoch: int
+    quota_5h_remaining: int = -1
+    quota_5h_reset_epoch: int = 0
     quota_remaining: int = -1
     quota_used: int = -1
     quota_reset_epoch: int = 0
@@ -93,6 +95,7 @@ class UsageSnapshot:
         for model in self.radar.models[:12]:
             safe_name = re.sub(r"[^A-Za-z0-9 ._-]", "", model.name)[:18] or "Model"
             fields.extend((safe_name, str(model.score_tenths)))
+        fields.extend((str(self.quota_5h_remaining), str(self.quota_5h_reset_epoch)))
         return ",".join(fields)
 
 
@@ -391,8 +394,8 @@ class CodexAppServer:
             return response.get("result", {})
         raise TimeoutError(f"Timed out waiting for Codex method {method}")
 
-    def read_weekly_usage(self) -> tuple[int, int, int]:
-        result = self._request("account/rateLimits/read")
+    @staticmethod
+    def _parse_rate_limits(result: dict[str, Any]) -> tuple[int, int, int, int, int]:
         snapshot = result.get("rateLimits") or {}
         if not snapshot:
             snapshot = (result.get("rateLimitsByLimitId") or {}).get("codex", {})
@@ -400,9 +403,45 @@ class CodexAppServer:
         windows = [window for window in windows if window and window.get("windowDurationMins")]
         if not windows:
             raise RuntimeError("Codex did not return a rate-limit window")
+
         weekly = max(windows, key=lambda item: int(item.get("windowDurationMins") or 0))
-        used = max(0, min(100, int(weekly.get("usedPercent") or 0)))
-        return 100 - used, used, int(weekly.get("resetsAt") or 0)
+        weekly_used = max(0, min(100, int(weekly.get("usedPercent") or 0)))
+
+        five_hour = next(
+            (window for window in windows if int(window.get("windowDurationMins") or 0) == 300),
+            None,
+        )
+        if five_hour is None:
+            for limit in (result.get("rateLimitsByLimitId") or {}).values():
+                candidates = (limit.get("primary"), limit.get("secondary"))
+                five_hour = next(
+                    (
+                        window
+                        for window in candidates
+                        if window and int(window.get("windowDurationMins") or 0) == 300
+                    ),
+                    None,
+                )
+                if five_hour is not None:
+                    break
+
+        five_hour_remaining = -1
+        five_hour_reset_epoch = 0
+        if five_hour is not None:
+            five_hour_used = max(0, min(100, int(five_hour.get("usedPercent") or 0)))
+            five_hour_remaining = 100 - five_hour_used
+            five_hour_reset_epoch = int(five_hour.get("resetsAt") or 0)
+
+        return (
+            100 - weekly_used,
+            weekly_used,
+            int(weekly.get("resetsAt") or 0),
+            five_hour_remaining,
+            five_hour_reset_epoch,
+        )
+
+    def read_usage_limits(self) -> tuple[int, int, int, int, int]:
+        return self._parse_rate_limits(self._request("account/rateLimits/read"))
 
     def close(self) -> None:
         if self._process.poll() is None:
@@ -563,10 +602,14 @@ class MetricsCollector:
         remaining = previous.quota_remaining if previous else -1
         used = previous.quota_used if previous else -1
         reset_epoch = previous.quota_reset_epoch if previous else 0
+        five_hour_remaining = previous.quota_5h_remaining if previous else -1
+        five_hour_reset_epoch = previous.quota_5h_reset_epoch if previous else 0
         try:
             if self.codex is None:
                 self.codex = CodexAppServer(self._find_codex())
-            remaining, used, reset_epoch = self.codex.read_weekly_usage()
+            remaining, used, reset_epoch, five_hour_remaining, five_hour_reset_epoch = (
+                self.codex.read_usage_limits()
+            )
         except Exception as error:
             print(f"Codex read failed: {error}", flush=True)
             if self.codex:
@@ -595,6 +638,8 @@ class MetricsCollector:
         snapshot = UsageSnapshot(
             host=host,
             fetched_epoch=now,
+            quota_5h_remaining=five_hour_remaining,
+            quota_5h_reset_epoch=five_hour_reset_epoch,
             quota_remaining=remaining,
             quota_used=used,
             quota_reset_epoch=reset_epoch,
@@ -605,7 +650,7 @@ class MetricsCollector:
         )
         print(
             "Updated: "
-            f"Codex {snapshot.quota_remaining}% left; "
+            f"Codex 5H {snapshot.quota_5h_remaining}% / 7D {snapshot.quota_remaining}% left; "
             f"24H ${snapshot.usage_24h.cost_cents / 100:.2f}/{snapshot.usage_24h.total_tokens:,}; "
             f"7D ${snapshot.usage_7d.cost_cents / 100:.2f}/{snapshot.usage_7d.total_tokens:,}; "
             f"30D ${snapshot.usage_30d.cost_cents / 100:.2f}/{snapshot.usage_30d.total_tokens:,}; "
