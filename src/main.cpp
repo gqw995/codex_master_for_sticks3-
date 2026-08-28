@@ -264,19 +264,17 @@ void drawQuotaCard(int y, const String& label, int remaining, int64_t resetEpoch
   const uint32_t accent = remaining < 0 ? kMuted : colorForRemaining(remaining);
   M5.Display.fillRoundRect(8, y, M5.Display.width() - 16, 73, 9, kPanel);
 
-  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextDatum(top_center);
   M5.Display.setTextFont(1);
   M5.Display.setTextColor(kMuted, kPanel);
-  M5.Display.drawString(label + " LEFT", 16, y + 7);
-  M5.Display.setTextDatum(top_right);
-  M5.Display.drawString("RESET " + countdownText(resetEpoch), M5.Display.width() - 16, y + 7);
+  M5.Display.drawString(label + " LEFT", M5.Display.width() / 2, y + 5);
+  M5.Display.drawString("RESET IN " + countdownText(resetEpoch), M5.Display.width() / 2, y + 16);
 
-  M5.Display.setTextDatum(top_center);
   M5.Display.setTextFont(4);
   M5.Display.setTextColor(accent, kPanel);
   M5.Display.drawString(remaining < 0 ? "--" : String(remaining) + "%", M5.Display.width() / 2,
-                        y + 23);
-  drawProgressBar(16, y + 57, M5.Display.width() - 32, 8, max(0, remaining), accent);
+                        y + 29);
+  drawProgressBar(16, y + 60, M5.Display.width() - 32, 7, max(0, remaining), accent);
 }
 
 void drawCodexScreen() {
