@@ -39,7 +39,7 @@ constexpr uint8_t kMaxRadarModels = 12;
 enum class ScreenPage : uint8_t { Codex = 0, Vibe = 1, Radar = 2 };
 enum class TimeRange : uint8_t { H24 = 0, D7 = 1, D30 = 2 };
 enum class DataSource : uint8_t { Cache = 0, Usb = 1, Wifi = 2 };
-enum class RefreshState : uint8_t { Idle = 0, Pending = 1, Success = 2, Failed = 3 };
+enum class RefreshState : uint8_t { Idle = 0, Pending = 1, Success = 2, Failed = 3, Partial = 4 };
 
 struct PeriodUsage {
   int32_t costCents = -1;
@@ -78,6 +78,7 @@ uint32_t lastUsbMillis = 0;
 uint32_t lastWifiMillis = 0;
 RefreshState refreshState = RefreshState::Idle;
 uint32_t refreshStateMillis = 0;
+int64_t refreshAfterEpoch = 0;
 
 DNSServer dnsServer;
 WebServer webServer(80);
@@ -165,7 +166,7 @@ String formatUpdateTime(int64_t epoch) {
 }
 
 String countdownText(int64_t resetEpoch) {
-  if (resetEpoch <= 0 || usage.fetchedEpoch <= 0) return "--";
+  if (resetEpoch <= 0 || usage.fetchedEpoch <= 0 || dataSource == DataSource::Cache) return "--";
   const int64_t elapsed = static_cast<int64_t>((millis() - snapshotMillis) / 1000);
   int64_t seconds = resetEpoch - usage.fetchedEpoch - elapsed;
   if (seconds < 0) seconds = 0;
@@ -228,9 +229,29 @@ void drawHeader(const String& title, uint32_t titleColor) {
   }
 }
 
+bool pageDataAvailable() {
+  if (currentPage == ScreenPage::Codex) return usage.quotaRemaining >= 0 || usage.quota5hRemaining >= 0;
+  if (currentPage == ScreenPage::Vibe) {
+    const PeriodUsage& selected = usage.periods[static_cast<int>(currentRange)];
+    return selected.costCents >= 0 && selected.totalTokens >= 0;
+  }
+  return usage.radarCount > 0;
+}
+
+bool allSourcesAvailable() {
+  if (usage.quotaRemaining < 0 && usage.quota5hRemaining < 0) return false;
+  for (const PeriodUsage& period : usage.periods) {
+    if (period.costCents < 0 || period.totalTokens < 0) return false;
+  }
+  return usage.radarCount > 0 && !usage.radarUpdated.endsWith(" OLD");
+}
+
 String refreshFooterText() {
   if (refreshState == RefreshState::Pending) return "REFRESHING...";
+  if (!pageDataAvailable()) return "SOURCE ERROR";
+  if (currentPage == ScreenPage::Radar && usage.radarUpdated.endsWith(" OLD")) return "SOURCE OLD";
   if (refreshState == RefreshState::Success) return "REFRESH OK";
+  if (refreshState == RefreshState::Partial) return "REFRESH PARTIAL";
   if (refreshState == RefreshState::Failed) return "REFRESH FAILED";
   if (dataSource == DataSource::Cache) return "SAVED DATA";
   return sourceText() + " CONNECTED";
@@ -238,9 +259,12 @@ String refreshFooterText() {
 
 uint32_t refreshFooterColor() {
   if (refreshState == RefreshState::Pending) return kBlue;
+  if (!pageDataAvailable()) return kRed;
+  if (refreshState == RefreshState::Partial ||
+      (currentPage == ScreenPage::Radar && usage.radarUpdated.endsWith(" OLD"))) return kAmber;
   if (refreshState == RefreshState::Success) return kGreen;
   if (refreshState == RefreshState::Failed) return kRed;
-  return kMuted;
+  return dataSource == DataSource::Cache ? kMuted : kGreen;
 }
 
 void drawFooter(const String& radarUpdated = "") {
@@ -251,12 +275,9 @@ void drawFooter(const String& radarUpdated = "") {
     M5.Display.drawString("RADAR " + radarUpdated, M5.Display.width() / 2, 207);
   }
   M5.Display.setTextColor(kMuted, kBackground);
-  M5.Display.drawString("UPDATED " + formatUpdateTime(usage.fetchedEpoch),
+  M5.Display.drawString("UPDATED " + (pageDataAvailable() ? formatUpdateTime(usage.fetchedEpoch) : "--"),
                         M5.Display.width() / 2, 222);
   M5.Display.setTextColor(refreshFooterColor(), kBackground);
-  if (refreshState == RefreshState::Idle && dataSource != DataSource::Cache) {
-    M5.Display.setTextColor(kGreen, kBackground);
-  }
   M5.Display.drawString(refreshFooterText(), M5.Display.width() / 2, 237);
 }
 
@@ -268,8 +289,8 @@ void drawQuotaCard(int y, const String& label, int remaining, int64_t resetEpoch
   M5.Display.setTextFont(1);
   M5.Display.setTextColor(kMuted, kPanel);
   M5.Display.drawString(label + " LEFT", M5.Display.width() / 2, y + 5);
-  const String resetText =
-      remaining >= 100 && resetEpoch <= 0 ? "READY" : "RESET IN " + countdownText(resetEpoch);
+  const String resetText = remaining < 0 ? "NOT REPORTED" :
+      (remaining >= 100 && resetEpoch <= 0 ? "READY" : "RESET IN " + countdownText(resetEpoch));
   M5.Display.drawString(resetText, M5.Display.width() / 2, y + 16);
 
   M5.Display.setTextFont(4);
@@ -466,7 +487,8 @@ void sleepScreen() {
 }
 
 void serviceScreenTimeout() {
-  if (screenAwake && millis() - lastButtonActivityMillis >= kScreenTimeoutMs) sleepScreen();
+  if (screenAwake && refreshState != RefreshState::Pending &&
+      millis() - lastButtonActivityMillis >= kScreenTimeoutMs) sleepScreen();
 }
 
 void saveUiState() {
@@ -616,6 +638,7 @@ void requestRefresh() {
   const uint32_t now = millis();
   refreshState = RefreshState::Pending;
   refreshStateMillis = now;
+  refreshAfterEpoch = usage.fetchedEpoch;
   lastButtonActivityMillis = now;
   lastWifiRefreshRequestMillis = 0;
   Serial.println("STICKS3_REFRESH");
@@ -637,14 +660,15 @@ bool applyUsageLine(const String& line, DataSource incomingSource) {
     if (preferredHost != parsed.host) preferredHost = parsed.host;
   }
 
+  const bool newSnapshot = parsed.fetchedEpoch != usage.fetchedEpoch || dataSource == DataSource::Cache;
   const bool changed = !sameSnapshot(usage, parsed) || dataSource != incomingSource;
   usage = parsed;
   if (currentRadarPage >= radarPageCount()) currentRadarPage = 0;
   dataSource = incomingSource;
-  snapshotMillis = now;
-  const bool refreshCompleted = refreshState == RefreshState::Pending;
+  if (newSnapshot) snapshotMillis = now;
+  const bool refreshCompleted = refreshState == RefreshState::Pending && parsed.fetchedEpoch > refreshAfterEpoch;
   if (refreshCompleted) {
-    refreshState = RefreshState::Success;
+    refreshState = allSourcesAvailable() ? RefreshState::Success : RefreshState::Partial;
     refreshStateMillis = now;
     lastButtonActivityMillis = now;
   }
@@ -662,13 +686,8 @@ void readSerial() {
     if (ch == '\n') {
       serialLine.trim();
       if (serialLine == "STICKS3_REFRESH_ACK") {
-        if (refreshState == RefreshState::Pending) {
-          refreshState = RefreshState::Success;
-          refreshStateMillis = millis();
-          lastButtonActivityMillis = refreshStateMillis;
-          drawScreen();
-          Serial.println("STICKS3_REFRESH_DONE");
-        }
+        // Older bridges acknowledge receipt before collecting source data.
+        // Completion is determined only by a newer snapshot above.
       } else if (!serialLine.isEmpty()) {
         applyUsageLine(serialLine, DataSource::Usb);
       }
@@ -913,8 +932,10 @@ void loop() {
   if (refreshState == RefreshState::Pending && millis() - refreshStateMillis >= kRefreshTimeoutMs) {
     refreshState = RefreshState::Failed;
     refreshStateMillis = millis();
+    lastButtonActivityMillis = refreshStateMillis;
     drawScreen();
-  } else if ((refreshState == RefreshState::Success || refreshState == RefreshState::Failed) &&
+  } else if ((refreshState == RefreshState::Success || refreshState == RefreshState::Failed ||
+              refreshState == RefreshState::Partial) &&
              millis() - refreshStateMillis >= 4000) {
     refreshState = RefreshState::Idle;
     drawScreen();

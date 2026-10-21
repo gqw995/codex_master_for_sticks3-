@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
@@ -26,18 +29,34 @@ class CodexRadarTests(unittest.TestCase):
         self,
         page: str,
         data: dict[str, object] | None = None,
+        live_data: dict[str, object] | None = None,
+        now: str = "2026-07-22T06:00:00+00:00",
     ) -> codex_usage_bridge.RadarUsage:
+        self.requested_urls: list[str] = []
+
         def urlopen(request: object, timeout: int) -> FakeResponse:
-            if getattr(request, "full_url", "") == codex_usage_bridge.CODEX_RADAR_DATA_URL:
+            url = getattr(request, "full_url", "")
+            self.requested_urls.append(url)
+            if url == codex_usage_bridge.CODEX_RADAR_LIVE_URL:
+                if live_data is None:
+                    raise OSError("live endpoint unavailable")
+                return FakeResponse(json.dumps(live_data))
+            if url == codex_usage_bridge.CODEX_RADAR_DATA_URL:
                 if data is None:
                     raise OSError("current data endpoint unavailable")
                 return FakeResponse(json.dumps(data))
             return FakeResponse(page)
 
-        with mock.patch.object(
-            codex_usage_bridge.urllib.request,
-            "urlopen",
-            side_effect=urlopen,
+        with (
+            mock.patch.object(
+                codex_usage_bridge.urllib.request,
+                "urlopen",
+                side_effect=urlopen,
+            ),
+            mock.patch.object(
+                codex_usage_bridge.time, "time",
+                return_value=codex_usage_bridge.datetime.fromisoformat(now).timestamp(),
+            ),
         ):
             return codex_usage_bridge.MetricsCollector._read_codex_radar()
 
@@ -61,6 +80,71 @@ class CodexRadarTests(unittest.TestCase):
             ),
         )
 
+    def test_prefers_live_data_and_uses_latest_source_timestamp(self) -> None:
+        live_data = {
+            "schema": 3,
+            "benchmark_id": "deep-swe",
+            "source_updated_at": {
+                "codex": "2026-10-21T02:00:00Z",
+                "other": "2026-10-20T06:00:00Z",
+            },
+            "points": [{"model": "gpt-6-sol", "effort": "high", "iq": 98.6}],
+        }
+
+        radar = self.read_radar(
+            "", live_data=live_data, now="2026-10-21T03:00:00+00:00",
+        )
+
+        self.assertEqual(radar.updated, "10/21 10:00")
+        self.assertEqual(radar.models[0], codex_usage_bridge.RadarModel("6 Sol high", 986))
+        self.assertEqual(self.requested_urls, [codex_usage_bridge.CODEX_RADAR_LIVE_URL])
+
+    def test_marks_old_published_fallback_and_preserves_marker_on_wire(self) -> None:
+        data = {
+            "schema": 2,
+            "source_updated_at": "2026-10-01T23:00:27+08:00",
+            "points": [{"model": "gpt-5.6-sol", "effort": "high", "iq": 96.4}],
+        }
+
+        radar = self.read_radar("", data, now="2026-10-21T03:00:00+00:00")
+
+        self.assertEqual(radar.updated, "10/01 23:00 OLD")
+        self.assertEqual(
+            self.requested_urls,
+            [codex_usage_bridge.CODEX_RADAR_LIVE_URL, codex_usage_bridge.CODEX_RADAR_DATA_URL],
+        )
+        payload = codex_usage_bridge.UsageSnapshot(
+            host="Test", fetched_epoch=1, radar=radar,
+        ).wire_payload()
+        self.assertIn(",10/01 23:00 OLD,", payload)
+
+    def test_generated_time_is_used_when_source_time_is_missing(self) -> None:
+        data = {
+            "generated_at": "2026-10-21T02:00:00Z",
+            "points": [{"model": "gpt-6-sol", "effort": "high", "iq": 98.6}],
+        }
+
+        radar = self.read_radar("", live_data=data, now="2026-10-21T03:00:00+00:00")
+
+        self.assertEqual(radar.updated, "10/21 10:00")
+
+    def test_rejects_different_benchmark_before_published_fallback(self) -> None:
+        live_data = {
+            "benchmark_id": "other-benchmark",
+            "source_updated_at": "2026-10-21T02:00:00Z",
+            "points": [{"model": "gpt-6-sol", "effort": "high", "iq": 1}],
+        }
+        data = {
+            "source_updated_at": "2026-10-21T01:00:00Z",
+            "points": [{"model": "gpt-6-sol", "effort": "high", "iq": 98.6}],
+        }
+
+        radar = self.read_radar(
+            "", data=data, live_data=live_data, now="2026-10-21T03:00:00+00:00",
+        )
+
+        self.assertEqual(radar.models[0].score_tenths, 986)
+
     def test_keeps_support_for_legacy_degradation_radar_markup(self) -> None:
         page = """
         <section class="model-iq model-iq-green">
@@ -82,7 +166,7 @@ class CodexRadarTests(unittest.TestCase):
 
 
 class CodexRateLimitTests(unittest.TestCase):
-    def test_reads_default_weekly_and_model_specific_five_hour_windows(self) -> None:
+    def test_does_not_borrow_model_specific_five_hour_window(self) -> None:
         result = {
             "rateLimits": {
                 "limitId": "codex",
@@ -119,9 +203,9 @@ class CodexRateLimitTests(unittest.TestCase):
 
         limits = codex_usage_bridge.CodexAppServer._parse_rate_limits(result)
 
-        self.assertEqual(limits, (98, 2, 1788483429, 75, 1787897794))
+        self.assertEqual(limits, (98, 2, 1788483429, -1, 0))
 
-    def test_unused_five_hour_window_has_no_reset_countdown(self) -> None:
+    def test_unused_five_hour_window_preserves_reported_reset(self) -> None:
         result = {
             "rateLimits": {
                 "primary": {
@@ -129,23 +213,61 @@ class CodexRateLimitTests(unittest.TestCase):
                     "windowDurationMins": 10080,
                     "resetsAt": 1788483429,
                 },
-                "secondary": None,
-            },
-            "rateLimitsByLimitId": {
-                "codex_bengalfox": {
-                    "primary": {
-                        "usedPercent": 0,
-                        "windowDurationMins": 300,
-                        "resetsAt": 1787899925,
-                    },
-                    "secondary": None,
+                "secondary": {
+                    "usedPercent": 0,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1787899925,
                 },
             },
         }
 
         limits = codex_usage_bridge.CodexAppServer._parse_rate_limits(result)
 
-        self.assertEqual(limits, (96, 4, 1788483429, 100, 0))
+        self.assertEqual(limits, (96, 4, 1788483429, 100, 1787899925))
+
+    def test_prefers_named_codex_bucket_over_legacy_snapshot(self) -> None:
+        result = {
+            "rateLimits": {
+                "primary": {"usedPercent": 80, "windowDurationMins": 10080, "resetsAt": 111},
+            },
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "primary": {"usedPercent": 10, "windowDurationMins": 10080, "resetsAt": 222},
+                    "secondary": {"usedPercent": 25, "windowDurationMins": 300, "resetsAt": 333},
+                },
+            },
+        }
+
+        self.assertEqual(
+            codex_usage_bridge.CodexAppServer._parse_rate_limits(result),
+            (90, 10, 222, 75, 333),
+        )
+
+    def test_missing_or_null_percent_is_unknown_not_full(self) -> None:
+        for percent in ({}, {"usedPercent": None}):
+            with self.subTest(percent=percent):
+                result = {
+                    "rateLimits": {
+                        "primary": {**percent, "windowDurationMins": 10080, "resetsAt": 222},
+                        "secondary": {**percent, "windowDurationMins": 300, "resetsAt": 333},
+                    },
+                }
+                limits = codex_usage_bridge.CodexAppServer._parse_rate_limits(result)
+                self.assertEqual(limits[0:2], (-1, -1))
+                self.assertEqual(limits[3], -1)
+
+    def test_five_hour_only_window_is_not_weekly_quota(self) -> None:
+        result = {
+            "rateLimits": {
+                "primary": {"usedPercent": 30, "windowDurationMins": 300, "resetsAt": 333},
+                "secondary": {"usedPercent": 90, "windowDurationMins": 1440, "resetsAt": 444},
+            },
+        }
+
+        self.assertEqual(
+            codex_usage_bridge.CodexAppServer._parse_rate_limits(result),
+            (-1, -1, 0, 70, 333),
+        )
 
     def test_usage4_payload_appends_five_hour_window_after_radar_models(self) -> None:
         snapshot = codex_usage_bridge.UsageSnapshot(
@@ -166,6 +288,118 @@ class CodexRateLimitTests(unittest.TestCase):
 
         self.assertEqual(fields[0], "USAGE4")
         self.assertEqual(fields[-2:], ["75", "1787897794"])
+
+
+class MetricsCollectionTests(unittest.TestCase):
+    def test_finds_bundled_cli_when_path_has_no_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "ChatGPT.app/Contents/Resources/nested/codex"
+            candidate.parent.mkdir(parents=True)
+            candidate.write_text("#!/bin/sh\n", encoding="utf-8")
+            candidate.chmod(0o755)
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(codex_usage_bridge.shutil, "which", return_value=None),
+                mock.patch.object(codex_usage_bridge, "CODEX_BIN_CANDIDATES", (candidate,)),
+            ):
+                self.assertEqual(codex_usage_bridge.MetricsCollector._find_codex(), str(candidate))
+
+    def test_failed_sources_clear_cached_values_and_keep_successful_sources(self) -> None:
+        collector = codex_usage_bridge.MetricsCollector()
+        collector.codex = mock.Mock()
+        collector.codex.read_usage_limits.side_effect = RuntimeError("quota unavailable")
+        previous = codex_usage_bridge.UsageSnapshot(
+            host="old-host",
+            fetched_epoch=100,
+            quota_remaining=61,
+            quota_used=39,
+            quota_reset_epoch=1000,
+            quota_5h_remaining=75,
+            quota_5h_reset_epoch=500,
+            usage_24h=codex_usage_bridge.PeriodUsage(100, 1000),
+            usage_7d=codex_usage_bridge.PeriodUsage(200, 2000),
+            usage_30d=codex_usage_bridge.PeriodUsage(300, 3000),
+            radar=codex_usage_bridge.RadarUsage(
+                updated="07/21 12:11",
+                models=(codex_usage_bridge.RadarModel("Old model", 900),),
+            ),
+        )
+        fresh_period = codex_usage_bridge.PeriodUsage(400, 4000)
+
+        def read_period(days: int) -> codex_usage_bridge.PeriodUsage:
+            if days == 7:
+                return fresh_period
+            raise RuntimeError(f"{days}d unavailable")
+
+        with (
+            mock.patch.object(collector, "_vibe_config", return_value={"hostname": "test-host"}),
+            mock.patch.object(
+                collector, "_read_vibe_period",
+                side_effect=read_period,
+            ),
+            mock.patch.object(collector, "_read_codex_radar", side_effect=RuntimeError("radar unavailable")),
+            mock.patch.object(codex_usage_bridge.time, "time", return_value=200),
+            mock.patch("builtins.print"),
+        ):
+            snapshot = collector.collect(previous)
+
+        self.assertEqual(snapshot.host, "test-host")
+        self.assertEqual(snapshot.fetched_epoch, 200)
+        self.assertEqual(
+            (snapshot.quota_remaining, snapshot.quota_used, snapshot.quota_reset_epoch,
+             snapshot.quota_5h_remaining, snapshot.quota_5h_reset_epoch),
+            (-1, -1, 0, -1, 0),
+        )
+        self.assertEqual(snapshot.usage_24h, codex_usage_bridge.PeriodUsage())
+        self.assertEqual(snapshot.usage_7d, fresh_period)
+        self.assertEqual(snapshot.usage_30d, codex_usage_bridge.PeriodUsage())
+        self.assertEqual(snapshot.radar, codex_usage_bridge.RadarUsage())
+
+
+class UsbRefreshTests(unittest.TestCase):
+    def test_refresh_request_does_not_send_cached_payload_or_early_success(self) -> None:
+        manager = codex_usage_bridge.UsbHotplugManager()
+        manager.device = mock.Mock()
+        manager.device.read_lines.return_value = ["STICKS3_REFRESH"]
+        manager.identified = True
+        manager.screen_awake = True
+        cached_payload = "USAGE4,cached-payload"
+
+        with mock.patch("builtins.print"):
+            self.assertTrue(manager.tick(cached_payload))
+
+        manager.device.write_line.assert_not_called()
+
+
+class WifiRefreshTests(unittest.TestCase):
+    def test_retry_at_collection_completion_delivers_result_before_recollecting(self) -> None:
+        snapshot = codex_usage_bridge.UsageSnapshot(host="test-host", fetched_epoch=200)
+        collector = mock.Mock()
+        collector.collect.return_value = snapshot
+        wifi = mock.Mock()
+        wifi.screen_awake = True
+        wifi.poll.return_value = True
+
+        def start_thread(*, target: object, daemon: bool) -> mock.Mock:
+            thread = mock.Mock()
+            thread.start.side_effect = target
+            # The first iteration has an in-flight collection. Its queued
+            # result is consumed at the start of the second iteration.
+            thread.is_alive.return_value = True
+            return thread
+
+        with (
+            mock.patch("sys.argv", ["codex_usage_bridge.py", "--no-usb"]),
+            mock.patch.object(codex_usage_bridge, "MetricsCollector", return_value=collector),
+            mock.patch.object(codex_usage_bridge, "WifiBroadcaster", return_value=wifi),
+            mock.patch.object(codex_usage_bridge.threading, "Thread", side_effect=start_thread),
+            mock.patch.object(codex_usage_bridge.time, "monotonic", return_value=100),
+            mock.patch.object(codex_usage_bridge.time, "sleep", side_effect=[None, KeyboardInterrupt]),
+        ):
+            self.assertEqual(codex_usage_bridge.main(), 0)
+
+        collector.collect.assert_called_once_with(None)
+        wifi.send.assert_called_once_with(snapshot.wire_payload())
 
 
 if __name__ == "__main__":

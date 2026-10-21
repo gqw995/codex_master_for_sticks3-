@@ -25,14 +25,21 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 
-DEFAULT_CODEX = "/Applications/ChatGPT.app/Contents/Resources/codex"
+CODEX_BIN_CANDIDATES = tuple(
+    root / app / "Contents/Resources" / relative
+    for root in (Path("/Applications"), Path.home() / "Applications")
+    for app in ("ChatGPT.app", "Codex.app")
+    for relative in ("codex-cli/CodexCLI.app/Contents/MacOS/codex", "codex-cli/bin/codex", "codex")
+)
 DEFAULT_VIBE_API = "https://vibecafe.ai"
 CODEX_RADAR_URL = "https://codexradar.com/"
+CODEX_RADAR_LIVE_URL = "https://codexradar.com/api/intelligence-efficiency-metrics"
 CODEX_RADAR_DATA_URL = "https://codexradar.com/data/intelligence-efficiency.json"
 WIFI_BROADCAST_PORT = 47322
 PROTOCOL_PREFIX = "USAGE4"
@@ -89,7 +96,7 @@ class UsageSnapshot:
             str(self.usage_7d.total_tokens),
             str(self.usage_30d.cost_cents),
             str(self.usage_30d.total_tokens),
-            re.sub(r"[^0-9/: -]", "", self.radar.updated)[:18],
+            re.sub(r"[^A-Z0-9/: -]", "", self.radar.updated)[:18],
             str(min(12, len(self.radar.models))),
         ]
         for model in self.radar.models[:12]:
@@ -231,11 +238,11 @@ class UsbHotplugManager:
                 self._disconnect("not a Stick S3 usage display", reject_candidate=True)
                 return False
 
-            # Send the small acknowledgement before the much larger metrics
-            # payload so refresh status never waits behind aggregate data.
             if self.identified and refresh_requested:
-                self.device.write_line("STICKS3_REFRESH_ACK")
-                print("Stick S3 refresh request acknowledged", flush=True)
+                # A cached payload or early ACK would make old firmware report
+                # success before any of the requested sources have been read.
+                print("Stick S3 refresh requested; collecting new data", flush=True)
+                return True
             if self.identified and self.screen_awake and payload:
                 changed = payload != self.last_payload
                 heartbeat_due = now - self.last_send >= 30.0
@@ -396,52 +403,31 @@ class CodexAppServer:
 
     @staticmethod
     def _parse_rate_limits(result: dict[str, Any]) -> tuple[int, int, int, int, int]:
-        snapshot = result.get("rateLimits") or {}
-        if not snapshot:
-            snapshot = (result.get("rateLimitsByLimitId") or {}).get("codex", {})
+        buckets = result.get("rateLimitsByLimitId")
+        if isinstance(buckets, dict):
+            snapshot = buckets.get("codex") or {}
+        else:
+            snapshot = result.get("rateLimits") or {}
+        if snapshot.get("limitId") not in (None, "codex"):
+            snapshot = {}
         windows = [snapshot.get("primary"), snapshot.get("secondary")]
         windows = [window for window in windows if window and window.get("windowDurationMins")]
         if not windows:
             raise RuntimeError("Codex did not return a rate-limit window")
 
-        weekly = max(windows, key=lambda item: int(item.get("windowDurationMins") or 0))
-        weekly_used = max(0, min(100, int(weekly.get("usedPercent") or 0)))
+        def read_window(duration: int) -> tuple[int, int, int]:
+            window = next(
+                (item for item in windows if int(item.get("windowDurationMins") or 0) == duration),
+                None,
+            )
+            if window is None or window.get("usedPercent") is None:
+                return -1, -1, 0
+            used = max(0, min(100, int(window["usedPercent"])))
+            return 100 - used, used, int(window.get("resetsAt") or 0)
 
-        five_hour = next(
-            (window for window in windows if int(window.get("windowDurationMins") or 0) == 300),
-            None,
-        )
-        if five_hour is None:
-            for limit in (result.get("rateLimitsByLimitId") or {}).values():
-                candidates = (limit.get("primary"), limit.get("secondary"))
-                five_hour = next(
-                    (
-                        window
-                        for window in candidates
-                        if window and int(window.get("windowDurationMins") or 0) == 300
-                    ),
-                    None,
-                )
-                if five_hour is not None:
-                    break
-
-        five_hour_remaining = -1
-        five_hour_reset_epoch = 0
-        if five_hour is not None:
-            five_hour_used = max(0, min(100, int(five_hour.get("usedPercent") or 0)))
-            five_hour_remaining = 100 - five_hour_used
-            # An unused 5-hour window has not started yet. Codex reports
-            # resetsAt as "now + 5h" in that state, so it is not a countdown.
-            if five_hour_used > 0:
-                five_hour_reset_epoch = int(five_hour.get("resetsAt") or 0)
-
-        return (
-            100 - weekly_used,
-            weekly_used,
-            int(weekly.get("resetsAt") or 0),
-            five_hour_remaining,
-            five_hour_reset_epoch,
-        )
+        weekly_remaining, weekly_used, weekly_reset = read_window(10080)
+        five_hour_remaining, _, five_hour_reset = read_window(300)
+        return weekly_remaining, weekly_used, weekly_reset, five_hour_remaining, five_hour_reset
 
     def read_usage_limits(self) -> tuple[int, int, int, int, int]:
         return self._parse_rate_limits(self._request("account/rateLimits/read"))
@@ -463,12 +449,15 @@ class MetricsCollector:
     def _find_codex() -> str:
         override = os.environ.get("CODEX_USAGE_CODEX_BIN")
         if override:
-            return override
+            if os.access(override, os.X_OK):
+                return override
+            raise FileNotFoundError("CODEX_USAGE_CODEX_BIN is not executable")
         discovered = shutil.which("codex")
         if discovered:
             return discovered
-        if os.path.exists(DEFAULT_CODEX):
-            return DEFAULT_CODEX
+        for candidate in CODEX_BIN_CANDIDATES:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
         raise FileNotFoundError("Could not find the Codex CLI")
 
     @staticmethod
@@ -509,53 +498,68 @@ class MetricsCollector:
     @staticmethod
     def _read_codex_radar() -> RadarUsage:
         data_error: Exception | None = None
-        try:
-            request = urllib.request.Request(
-                CODEX_RADAR_DATA_URL,
-                headers={"User-Agent": "StickS3-Usage-Bridge/3.0"},
-                method="GET",
-            )
-            with urllib.request.urlopen(request, timeout=25) as response:
-                data = json.load(response)
-
-            source_updated_at = str(data.get("source_updated_at") or "")
-            updated_at = datetime.fromisoformat(source_updated_at.replace("Z", "+00:00"))
-            if updated_at.tzinfo is None:
-                updated_at = updated_at.replace(tzinfo=timezone.utc)
-            updated_at = updated_at.astimezone(timezone(timedelta(hours=8)))
-
-            model_names = {
-                "gpt-5.6-sol": "Sol",
-                "gpt-5.6-terra": "Terra",
-                "gpt-5.6-luna": "Luna",
-                "gpt-5.5": "5.5",
-            }
-            models: list[RadarModel] = []
-            for point in data.get("points") or []:
-                model_id = str(point.get("model") or "").strip()
-                effort = str(point.get("effort") or "").strip()
-                iq = point.get("iq")
-                if not model_id or not effort or iq is None:
-                    continue
-                model_name = model_names.get(model_id)
-                if not model_name:
-                    model_name = model_id.removeprefix("gpt-").replace("-", " ").title()
-                models.append(
-                    RadarModel(name=f"{model_name} {effort}", score_tenths=round(float(iq) * 10))
+        for url, timeout in ((CODEX_RADAR_LIVE_URL, 10), (CODEX_RADAR_DATA_URL, 20)):
+            try:
+                request = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "StickS3-Usage-Bridge/3.0"},
+                    method="GET",
                 )
-            if not models:
-                raise RuntimeError("Codex Radar model scores were not found")
-            models.sort(key=lambda model: (-model.score_tenths, model.name.lower()))
-            return RadarUsage(updated=updated_at.strftime("%m/%d %H:%M"), models=tuple(models[:12]))
-        except Exception as error:
-            data_error = error
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    data = json.load(response)
+                if data.get("benchmark_id") and data["benchmark_id"] != "deep-swe":
+                    raise RuntimeError("Unexpected Codex Radar benchmark cohort")
+
+                source = data.get("source_updated_at") or data.get("generated_at")
+                source_values = source.values() if isinstance(source, dict) else (source,)
+                source_dates: list[datetime] = []
+                for value in source_values:
+                    try:
+                        source_date = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                    except ValueError:
+                        continue
+                    if source_date.tzinfo is None:
+                        source_date = source_date.replace(tzinfo=timezone.utc)
+                    source_dates.append(source_date)
+                if not source_dates:
+                    raise RuntimeError("Codex Radar source update time was not found")
+                updated_at = max(source_dates).astimezone(timezone(timedelta(hours=8)))
+
+                model_names = {
+                    "gpt-5.6-sol": "Sol",
+                    "gpt-5.6-terra": "Terra",
+                    "gpt-5.6-luna": "Luna",
+                    "gpt-5.5": "5.5",
+                }
+                models: list[RadarModel] = []
+                for point in data.get("points") or []:
+                    model_id = str(point.get("model") or "").strip()
+                    effort = str(point.get("effort") or "").strip()
+                    iq = point.get("iq")
+                    if not model_id or not effort or iq is None:
+                        continue
+                    model_name = model_names.get(model_id)
+                    if not model_name:
+                        model_name = model_id.removeprefix("gpt-").replace("-", " ").title()
+                    models.append(
+                        RadarModel(name=f"{model_name} {effort}", score_tenths=round(float(iq) * 10))
+                    )
+                if not models:
+                    raise RuntimeError("Codex Radar model scores were not found")
+                models.sort(key=lambda model: (-model.score_tenths, model.name.lower()))
+                updated = updated_at.strftime("%m/%d %H:%M")
+                if time.time() - updated_at.timestamp() > 48 * 3600:
+                    updated += " OLD"
+                return RadarUsage(updated=updated, models=tuple(models[:12]))
+            except Exception as error:
+                data_error = error
 
         request = urllib.request.Request(
             CODEX_RADAR_URL,
             headers={"User-Agent": "StickS3-Usage-Bridge/3.0"},
             method="GET",
         )
-        with urllib.request.urlopen(request, timeout=25) as response:
+        with urllib.request.urlopen(request, timeout=10) as response:
             page = response.read().decode("utf-8", errors="replace")
 
         section_match = re.search(
@@ -594,7 +598,6 @@ class MetricsCollector:
         return RadarUsage(updated=updated, models=tuple(models[:12]))
 
     def collect(self, previous: UsageSnapshot | None = None) -> UsageSnapshot:
-        now = int(time.time())
         host = socket.gethostname().split(".")[0]
         try:
             config = self._vibe_config()
@@ -602,45 +605,41 @@ class MetricsCollector:
         except Exception:
             pass
 
-        remaining = previous.quota_remaining if previous else -1
-        used = previous.quota_used if previous else -1
-        reset_epoch = previous.quota_reset_epoch if previous else 0
-        five_hour_remaining = previous.quota_5h_remaining if previous else -1
-        five_hour_reset_epoch = previous.quota_5h_reset_epoch if previous else 0
-        try:
+        remaining, used, reset_epoch, five_hour_remaining, five_hour_reset_epoch = -1, -1, 0, -1, 0
+        periods = {days: PeriodUsage() for days in (1, 7, 30)}
+        radar = RadarUsage()
+
+        def read_codex() -> tuple[int, int, int, int, int]:
             if self.codex is None:
                 self.codex = CodexAppServer(self._find_codex())
-            remaining, used, reset_epoch, five_hour_remaining, five_hour_reset_epoch = (
-                self.codex.read_usage_limits()
-            )
-        except Exception as error:
-            print(f"Codex read failed: {error}", flush=True)
-            if self.codex:
-                self.codex.close()
-            self.codex = None
+            return self.codex.read_usage_limits()
 
-        periods: dict[int, PeriodUsage] = {}
-        prior = {
-            1: previous.usage_24h if previous else PeriodUsage(),
-            7: previous.usage_7d if previous else PeriodUsage(),
-            30: previous.usage_30d if previous else PeriodUsage(),
-        }
-        for days in (1, 7, 30):
+        # Sources are independent. Parallel reads fit within the device's
+        # refresh deadline even when one service is slow or unavailable.
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            codex_result = pool.submit(read_codex)
+            period_results = {days: pool.submit(self._read_vibe_period, days) for days in periods}
+            radar_result = pool.submit(self._read_codex_radar)
             try:
-                periods[days] = self._read_vibe_period(days)
+                remaining, used, reset_epoch, five_hour_remaining, five_hour_reset_epoch = codex_result.result()
             except Exception as error:
-                print(f"Vibe Usage {days}d read failed: {error}", flush=True)
-                periods[days] = prior[days]
-
-        radar = previous.radar if previous else RadarUsage()
-        try:
-            radar = self._read_codex_radar()
-        except Exception as error:
-            print(f"Codex Radar read failed: {error}", flush=True)
+                print(f"Codex read failed: {error}", flush=True)
+                if self.codex:
+                    self.codex.close()
+                self.codex = None
+            for days, result in period_results.items():
+                try:
+                    periods[days] = result.result()
+                except Exception as error:
+                    print(f"Vibe Usage {days}d read failed: {error}", flush=True)
+            try:
+                radar = radar_result.result()
+            except Exception as error:
+                print(f"Codex Radar read failed: {error}", flush=True)
 
         snapshot = UsageSnapshot(
             host=host,
-            fetched_epoch=now,
+            fetched_epoch=int(time.time()),
             quota_5h_remaining=five_hour_remaining,
             quota_5h_reset_epoch=five_hour_reset_epoch,
             quota_remaining=remaining,
@@ -705,6 +704,7 @@ def main() -> int:
     try:
         while True:
             now = time.monotonic()
+            collection_completed = False
 
             try:
                 completed, result = collection_results.get_nowait()
@@ -716,25 +716,32 @@ def main() -> int:
                     snapshot = result
                     payload = snapshot.wire_payload()
                     next_wifi = 0.0
+                    collection_completed = True
                 else:
                     print(f"Metrics collection failed: {result}", flush=True)
 
-            usb_refresh_requested = usb.tick(payload) if usb else False
+            collecting = bool(collection_thread and collection_thread.is_alive())
+            usb_refresh_requested = usb.tick(None if collecting else payload) if usb else False
             wifi_refresh_requested = wifi.poll(snapshot.host if snapshot else "") if wifi else False
             refresh_requested = usb_refresh_requested or wifi_refresh_requested
             if wifi_refresh_requested:
                 next_wifi = 0.0
-            if wifi and wifi.screen_awake is not None:
+            if usb and usb.identified:
+                device_sleeping = not usb.screen_awake
+            elif wifi and wifi.screen_awake is not None:
                 device_sleeping = not wifi.screen_awake
             else:
                 device_sleeping = bool(usb and not usb.screen_awake)
-            if not device_sleeping and (now >= next_poll or refresh_requested) and not (
+            # Retry packets received while a collection ran are fulfilled by
+            # that result. Deliver it before considering another collection.
+            if not device_sleeping and not collection_completed and (now >= next_poll or refresh_requested) and not (
                 collection_thread and collection_thread.is_alive()
             ):
                 start_collection(snapshot)
                 next_poll = now + max(30, args.interval)
 
-            if not device_sleeping and wifi and payload and now >= next_wifi:
+            collecting = bool(collection_thread and collection_thread.is_alive())
+            if not device_sleeping and not collecting and wifi and payload and now >= next_wifi:
                 try:
                     wifi.send(payload)
                 except OSError as error:
