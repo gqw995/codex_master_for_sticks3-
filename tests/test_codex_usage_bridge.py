@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import gzip
+import io
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -11,8 +14,9 @@ from tools import codex_usage_bridge
 
 
 class FakeResponse:
-    def __init__(self, body: str) -> None:
-        self.body = body.encode("utf-8")
+    def __init__(self, body: str | bytes, headers: dict[str, str] | None = None) -> None:
+        self.body = io.BytesIO(body.encode("utf-8") if isinstance(body, str) else body)
+        self.headers = headers or {}
 
     def __enter__(self) -> "FakeResponse":
         return self
@@ -20,11 +24,37 @@ class FakeResponse:
     def __exit__(self, *args: object) -> None:
         return None
 
-    def read(self) -> bytes:
-        return self.body
+    def read(self, size: int = -1) -> bytes:
+        return self.body.read(size)
 
 
 class CodexRadarTests(unittest.TestCase):
+    def test_reads_gzip_compressed_radar_response(self) -> None:
+        data = {
+            "source_updated_at": "2026-10-22T02:00:00Z",
+            "points": [{"model": "gpt-6-sol", "effort": "high", "iq": 98.6}],
+        }
+        body = gzip.compress(json.dumps(data).encode("utf-8"))
+        response = FakeResponse(body, {"Content-Encoding": "gzip"})
+        with mock.patch.object(codex_usage_bridge.urllib.request, "urlopen", return_value=response) as opened:
+            radar = codex_usage_bridge.MetricsCollector._read_codex_radar()
+
+        self.assertEqual(radar.models[0].score_tenths, 986)
+        self.assertEqual(opened.call_args.args[0].get_header("Accept-encoding"), "gzip")
+
+    def test_cancellation_stops_http_fallbacks(self) -> None:
+        cancelled = threading.Event()
+
+        def urlopen(request: object, timeout: float) -> FakeResponse:
+            cancelled.set()
+            raise OSError("live endpoint failed")
+
+        with mock.patch.object(codex_usage_bridge.urllib.request, "urlopen", side_effect=urlopen) as opened:
+            with self.assertRaisesRegex(RuntimeError, "cancelled"):
+                codex_usage_bridge.MetricsCollector._read_codex_radar(cancelled)
+
+        self.assertEqual(opened.call_count, 1)
+
     def read_radar(
         self,
         page: str,
@@ -269,7 +299,7 @@ class CodexRateLimitTests(unittest.TestCase):
             (-1, -1, 0, 70, 333),
         )
 
-    def test_usage4_payload_appends_five_hour_window_after_radar_models(self) -> None:
+    def test_usage5_payload_appends_source_status_after_legacy_five_hour_fields(self) -> None:
         snapshot = codex_usage_bridge.UsageSnapshot(
             host="Test Mac",
             fetched_epoch=1787890000,
@@ -278,6 +308,11 @@ class CodexRateLimitTests(unittest.TestCase):
             quota_remaining=98,
             quota_used=2,
             quota_reset_epoch=1788483429,
+            pending_mask=16,
+            codex_fetched_epoch=1787890000,
+            vibe24_fetched_epoch=1787890001,
+            vibe7_fetched_epoch=1787890002,
+            vibe30_fetched_epoch=1787890003,
             radar=codex_usage_bridge.RadarUsage(
                 updated="08/28 09:00",
                 models=(codex_usage_bridge.RadarModel("Sol high", 912),),
@@ -286,8 +321,9 @@ class CodexRateLimitTests(unittest.TestCase):
 
         fields = snapshot.wire_payload().split(",")
 
-        self.assertEqual(fields[0], "USAGE4")
-        self.assertEqual(fields[-2:], ["75", "1787897794"])
+        self.assertEqual(fields[0], "USAGE5")
+        self.assertEqual(fields[-8:-6], ["75", "1787897794"])
+        self.assertEqual(fields[-6:], ["16", "1787890000", "1787890001", "1787890002", "1787890003", "0"])
 
 
 class MetricsCollectionTests(unittest.TestCase):
@@ -354,6 +390,87 @@ class MetricsCollectionTests(unittest.TestCase):
         self.assertEqual(snapshot.usage_7d, fresh_period)
         self.assertEqual(snapshot.usage_30d, codex_usage_bridge.PeriodUsage())
         self.assertEqual(snapshot.radar, codex_usage_bridge.RadarUsage())
+        self.assertEqual(snapshot.pending_mask, 0)
+        self.assertEqual(
+            (snapshot.codex_fetched_epoch, snapshot.vibe24_fetched_epoch,
+             snapshot.vibe7_fetched_epoch, snapshot.vibe30_fetched_epoch, snapshot.radar_fetched_epoch),
+            (0, 0, 200, 0, 0),
+        )
+
+    def test_fast_sources_are_published_while_radar_is_still_blocked(self) -> None:
+        collector = codex_usage_bridge.MetricsCollector()
+        collector.codex = mock.Mock()
+        collector.codex.read_usage_limits.return_value = (90, 10, 999, -1, 0)
+        release_radar = threading.Event()
+        core_ready = threading.Event()
+        progress: list[codex_usage_bridge.UsageSnapshot] = []
+        completed: list[codex_usage_bridge.UsageSnapshot] = []
+
+        def read_radar(cancel_event: threading.Event) -> codex_usage_bridge.RadarUsage:
+            if not release_radar.wait(2):
+                raise RuntimeError("test did not release radar")
+            return codex_usage_bridge.RadarUsage("10/22 12:00", (codex_usage_bridge.RadarModel("Sol", 900),))
+
+        def publish(snapshot: codex_usage_bridge.UsageSnapshot) -> None:
+            progress.append(snapshot)
+            if snapshot.pending_mask == 16:
+                core_ready.set()
+
+        with (
+            mock.patch.object(collector, "_vibe_config", return_value={"hostname": "test-host"}),
+            mock.patch.object(collector, "_read_vibe_period", return_value=codex_usage_bridge.PeriodUsage(100, 1000)),
+            mock.patch.object(collector, "_read_codex_radar", side_effect=read_radar),
+            mock.patch.object(codex_usage_bridge.time, "time", return_value=200),
+            mock.patch("builtins.print"),
+        ):
+            worker = threading.Thread(target=lambda: completed.append(collector.collect(on_progress=publish)))
+            worker.start()
+            try:
+                self.assertTrue(core_ready.wait(2))
+                self.assertTrue(worker.is_alive())
+                self.assertEqual(progress[0].pending_mask, 31)
+                self.assertEqual(progress[0].quota_remaining, -1)
+                self.assertEqual(progress[-1].quota_remaining, 90)
+                self.assertEqual(progress[-1].codex_fetched_epoch, 200)
+                self.assertEqual(progress[-1].vibe30_fetched_epoch, 200)
+                self.assertEqual(progress[-1].radar_fetched_epoch, 0)
+            finally:
+                release_radar.set()
+                worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(completed[0].pending_mask, 0)
+        self.assertEqual(completed[0].radar_fetched_epoch, 200)
+
+    def test_cancelled_refresh_drops_late_radar_and_returns_no_cached_values(self) -> None:
+        collector = codex_usage_bridge.MetricsCollector()
+        collector.codex = mock.Mock()
+        collector.codex.read_usage_limits.return_value = (90, 10, 999, -1, 0)
+        cancelled = threading.Event()
+        progress: list[codex_usage_bridge.UsageSnapshot] = []
+
+        def read_radar(cancel_event: threading.Event) -> codex_usage_bridge.RadarUsage:
+            cancel_event.wait(2)
+            return codex_usage_bridge.RadarUsage("old", (codex_usage_bridge.RadarModel("Old", 900),))
+
+        def publish(snapshot: codex_usage_bridge.UsageSnapshot) -> None:
+            progress.append(snapshot)
+            if snapshot.pending_mask == 16:
+                cancelled.set()
+
+        with (
+            mock.patch.object(collector, "_vibe_config", return_value={"hostname": "test-host"}),
+            mock.patch.object(collector, "_read_vibe_period", return_value=codex_usage_bridge.PeriodUsage(100, 1000)),
+            mock.patch.object(collector, "_read_codex_radar", side_effect=read_radar),
+            mock.patch("builtins.print"),
+        ):
+            result = collector.collect(on_progress=publish, cancel_event=cancelled)
+
+        self.assertTrue(cancelled.is_set())
+        self.assertTrue(all(snapshot.radar_fetched_epoch == 0 for snapshot in progress))
+        self.assertEqual(result.quota_remaining, -1)
+        self.assertEqual(result.codex_fetched_epoch, 0)
+        self.assertEqual(result.usage_24h, codex_usage_bridge.PeriodUsage())
+        self.assertEqual(result.radar, codex_usage_bridge.RadarUsage())
 
 
 class UsbRefreshTests(unittest.TestCase):
@@ -398,8 +515,68 @@ class WifiRefreshTests(unittest.TestCase):
         ):
             self.assertEqual(codex_usage_bridge.main(), 0)
 
-        collector.collect.assert_called_once_with(None)
+        collector.collect.assert_called_once()
+        self.assertEqual(collector.collect.call_args.args, (None,))
+        self.assertTrue(callable(collector.collect.call_args.kwargs["on_progress"]))
         wifi.send.assert_called_once_with(snapshot.wire_payload())
+
+    def test_unknown_device_state_does_not_start_background_collection(self) -> None:
+        collector = mock.Mock()
+        wifi = mock.Mock()
+        wifi.screen_awake = None
+        wifi.poll.return_value = False
+        with (
+            mock.patch("sys.argv", ["codex_usage_bridge.py", "--no-usb"]),
+            mock.patch.object(codex_usage_bridge, "MetricsCollector", return_value=collector),
+            mock.patch.object(codex_usage_bridge, "WifiBroadcaster", return_value=wifi),
+            mock.patch.object(codex_usage_bridge.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            self.assertEqual(codex_usage_bridge.main(), 0)
+
+        collector.collect.assert_not_called()
+        wifi.send.assert_not_called()
+
+    def test_sleep_packet_discards_queued_results_before_transmission(self) -> None:
+        snapshot = codex_usage_bridge.UsageSnapshot(host="test-host", fetched_epoch=200)
+        collector = mock.Mock()
+
+        def collect(previous: object, on_progress: object, cancel_event: threading.Event) -> codex_usage_bridge.UsageSnapshot:
+            on_progress(snapshot)
+            return snapshot
+
+        collector.collect.side_effect = collect
+        wifi = mock.Mock()
+        wifi.screen_awake = True
+        polls = 0
+
+        def poll(host: str) -> bool:
+            nonlocal polls
+            polls += 1
+            if polls >= 2:
+                wifi.screen_awake = False
+            return polls == 1
+
+        wifi.poll.side_effect = poll
+
+        def start_thread(*, target: object, daemon: bool) -> mock.Mock:
+            thread = mock.Mock()
+            thread.start.side_effect = target
+            thread.is_alive.return_value = True
+            return thread
+
+        with (
+            mock.patch("sys.argv", ["codex_usage_bridge.py", "--no-usb"]),
+            mock.patch.object(codex_usage_bridge, "MetricsCollector", return_value=collector),
+            mock.patch.object(codex_usage_bridge, "WifiBroadcaster", return_value=wifi),
+            mock.patch.object(codex_usage_bridge.threading, "Thread", side_effect=start_thread),
+            mock.patch.object(codex_usage_bridge.time, "monotonic", return_value=100),
+            mock.patch.object(codex_usage_bridge.time, "sleep", side_effect=[None, KeyboardInterrupt]),
+        ):
+            self.assertEqual(codex_usage_bridge.main(), 0)
+
+        collector.collect.assert_called_once()
+        self.assertTrue(collector.collect.call_args.kwargs["cancel_event"].is_set())
+        wifi.send.assert_not_called()
 
 
 if __name__ == "__main__":

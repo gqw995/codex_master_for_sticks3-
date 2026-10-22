@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import errno
 import glob
+import gzip
 import html
 import json
 import os
@@ -24,11 +25,11 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 CODEX_BIN_CANDIDATES = tuple(
@@ -42,7 +43,7 @@ CODEX_RADAR_URL = "https://codexradar.com/"
 CODEX_RADAR_LIVE_URL = "https://codexradar.com/api/intelligence-efficiency-metrics"
 CODEX_RADAR_DATA_URL = "https://codexradar.com/data/intelligence-efficiency.json"
 WIFI_BROADCAST_PORT = 47322
-PROTOCOL_PREFIX = "USAGE4"
+PROTOCOL_PREFIX = "USAGE5"
 
 
 def safe_host_name(value: str) -> str:
@@ -80,6 +81,12 @@ class UsageSnapshot:
     usage_7d: PeriodUsage = PeriodUsage()
     usage_30d: PeriodUsage = PeriodUsage()
     radar: RadarUsage = RadarUsage()
+    pending_mask: int = 0
+    codex_fetched_epoch: int = 0
+    vibe24_fetched_epoch: int = 0
+    vibe7_fetched_epoch: int = 0
+    vibe30_fetched_epoch: int = 0
+    radar_fetched_epoch: int = 0
 
     def wire_payload(self) -> str:
         safe_host = safe_host_name(self.host)
@@ -103,6 +110,10 @@ class UsageSnapshot:
             safe_name = re.sub(r"[^A-Za-z0-9 ._-]", "", model.name)[:18] or "Model"
             fields.extend((safe_name, str(model.score_tenths)))
         fields.extend((str(self.quota_5h_remaining), str(self.quota_5h_reset_epoch)))
+        fields.extend(str(value) for value in (
+            self.pending_mask, self.codex_fetched_epoch, self.vibe24_fetched_epoch,
+            self.vibe7_fetched_epoch, self.vibe30_fetched_epoch, self.radar_fetched_epoch,
+        ))
         return ",".join(fields)
 
 
@@ -228,7 +239,7 @@ class UsbHotplugManager:
                 elif line == "STICKS3_REFRESH_DONE":
                     print("Stick S3 confirmed refresh response", flush=True)
                 elif line.startswith(("STICKS3_STATUS,", "STICKS3_BUTTON,", "STICKS3_PAGE,",
-                                      "STICKS3_POWER,", "STICKS3_BATTERY,")):
+                                      "STICKS3_POWER,", "STICKS3_BATTERY,", "STICKS3_DATA,")):
                     print(line, flush=True)
                 elif line == "USAGE_ACK":
                     now = time.monotonic()
@@ -246,16 +257,22 @@ class UsbHotplugManager:
                 # success before any of the requested sources have been read.
                 print("Stick S3 refresh requested; collecting new data", flush=True)
                 return True
-            if self.identified and self.screen_awake and payload:
-                changed = payload != self.last_payload
-                heartbeat_due = now - self.last_send >= 30.0
-                if changed or heartbeat_due or refresh_requested:
-                    self.device.write_line(payload)
-                    self.last_payload = payload
-                    self.last_send = now
+            self.send(payload)
         except OSError as error:
             self._disconnect(str(error))
         return refresh_requested
+
+    def send(self, payload: str | None) -> None:
+        if not self.device or not self.identified or not self.screen_awake or not payload:
+            return
+        now = time.monotonic()
+        if payload != self.last_payload or now - self.last_send >= 30.0:
+            try:
+                self.device.write_line(payload)
+                self.last_payload = payload
+                self.last_send = now
+            except OSError as error:
+                self._disconnect(str(error))
 
     def close(self) -> None:
         if self.device:
@@ -283,7 +300,7 @@ class WifiBroadcaster:
         targets = ["255.255.255.255"]
         try:
             output = subprocess.run(
-                ["/sbin/ifconfig"], check=False, capture_output=True, text=True, timeout=5
+                ["/sbin/ifconfig"], check=False, capture_output=True, text=True, timeout=1
             ).stdout
             targets.extend(re.findall(r"\binet\s+\d+(?:\.\d+){3}.*?\bbroadcast\s+(\d+(?:\.\d+){3})", output))
         except (OSError, subprocess.SubprocessError):
@@ -391,7 +408,7 @@ class CodexAppServer:
         if params is not None:
             message["params"] = params
         self._write(message)
-        deadline = time.monotonic() + 20.0
+        deadline = time.monotonic() + (8.0 if method == "account/rateLimits/read" else 4.0)
         while time.monotonic() < deadline:
             try:
                 response = self._responses.get(timeout=0.5)
@@ -483,7 +500,7 @@ class MetricsCollector:
             headers={"Authorization": f"Bearer {config['apiKey']}"},
             method="GET",
         )
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=6) as response:
             data = json.load(response)
 
         total_cost = 0.0
@@ -499,17 +516,41 @@ class MetricsCollector:
         return PeriodUsage(cost_cents=round(total_cost * 100), total_tokens=total_tokens)
 
     @staticmethod
-    def _read_codex_radar() -> RadarUsage:
+    def _read_codex_radar(cancel_event: threading.Event | None = None) -> RadarUsage:
+        deadline = time.monotonic() + 8.0
+
+        def read_url(url: str) -> bytes:
+            def check_deadline() -> float:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("Radar refresh cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Radar refresh exceeded 8 seconds")
+                return remaining
+
+            remaining = check_deadline()
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "StickS3-Usage-Bridge/3.0", "Accept-Encoding": "gzip"},
+                method="GET",
+            )
+            with urllib.request.urlopen(request, timeout=min(3.0, remaining)) as response:
+                chunks: list[bytes] = []
+                while True:
+                    check_deadline()
+                    chunk = response.read(64 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                check_deadline()
+                compressed = response.headers.get("Content-Encoding", "").lower() == "gzip"
+            body = b"".join(chunks)
+            return gzip.decompress(body) if compressed else body
+
         data_error: Exception | None = None
-        for url, timeout in ((CODEX_RADAR_LIVE_URL, 10), (CODEX_RADAR_DATA_URL, 20)):
+        for url in (CODEX_RADAR_LIVE_URL, CODEX_RADAR_DATA_URL):
             try:
-                request = urllib.request.Request(
-                    url,
-                    headers={"User-Agent": "StickS3-Usage-Bridge/3.0"},
-                    method="GET",
-                )
-                with urllib.request.urlopen(request, timeout=timeout) as response:
-                    data = json.load(response)
+                data = json.loads(read_url(url))
                 if data.get("benchmark_id") and data["benchmark_id"] != "deep-swe":
                     raise RuntimeError("Unexpected Codex Radar benchmark cohort")
 
@@ -557,13 +598,7 @@ class MetricsCollector:
             except Exception as error:
                 data_error = error
 
-        request = urllib.request.Request(
-            CODEX_RADAR_URL,
-            headers={"User-Agent": "StickS3-Usage-Bridge/3.0"},
-            method="GET",
-        )
-        with urllib.request.urlopen(request, timeout=10) as response:
-            page = response.read().decode("utf-8", errors="replace")
+        page = read_url(CODEX_RADAR_URL).decode("utf-8", errors="replace")
 
         section_match = re.search(
             r'<section\s+class="model-iq model-iq-green".*?</section>',
@@ -600,7 +635,12 @@ class MetricsCollector:
         models.sort(key=lambda model: (-model.score_tenths, model.name.lower()))
         return RadarUsage(updated=updated, models=tuple(models[:12]))
 
-    def collect(self, previous: UsageSnapshot | None = None) -> UsageSnapshot:
+    def collect(
+        self,
+        previous: UsageSnapshot | None = None,
+        on_progress: Callable[[UsageSnapshot], None] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> UsageSnapshot:
         host = socket.gethostname().split(".")[0]
         try:
             config = self._vibe_config()
@@ -608,51 +648,84 @@ class MetricsCollector:
         except Exception:
             pass
 
-        remaining, used, reset_epoch, five_hour_remaining, five_hour_reset_epoch = -1, -1, 0, -1, 0
-        periods = {days: PeriodUsage() for days in (1, 7, 30)}
-        radar = RadarUsage()
+        cancelled = cancel_event if cancel_event is not None else threading.Event()
+        snapshot = UsageSnapshot(host=host, fetched_epoch=int(time.time()), pending_mask=31)
+
+        def publish() -> None:
+            if on_progress is not None and not cancelled.is_set():
+                on_progress(snapshot)
+
+        if cancelled.is_set():
+            return replace(snapshot, pending_mask=0)
+        publish()
 
         def read_codex() -> tuple[int, int, int, int, int]:
-            if self.codex is None:
-                self.codex = CodexAppServer(self._find_codex())
-            return self.codex.read_usage_limits()
-
-        # Sources are independent. Parallel reads fit within the device's
-        # refresh deadline even when one service is slow or unavailable.
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            codex_result = pool.submit(read_codex)
-            period_results = {days: pool.submit(self._read_vibe_period, days) for days in periods}
-            radar_result = pool.submit(self._read_codex_radar)
             try:
-                remaining, used, reset_epoch, five_hour_remaining, five_hour_reset_epoch = codex_result.result()
-            except Exception as error:
-                print(f"Codex read failed: {error}", flush=True)
+                if self.codex is None:
+                    self.codex = CodexAppServer(self._find_codex())
+                return self.codex.read_usage_limits()
+            except Exception:
                 if self.codex:
                     self.codex.close()
                 self.codex = None
-            for days, result in period_results.items():
-                try:
-                    periods[days] = result.result()
-                except Exception as error:
-                    print(f"Vibe Usage {days}d read failed: {error}", flush=True)
-            try:
-                radar = radar_result.result()
-            except Exception as error:
-                print(f"Codex Radar read failed: {error}", flush=True)
+                raise
 
-        snapshot = UsageSnapshot(
-            host=host,
-            fetched_epoch=int(time.time()),
-            quota_5h_remaining=five_hour_remaining,
-            quota_5h_reset_epoch=five_hour_reset_epoch,
-            quota_remaining=remaining,
-            quota_used=used,
-            quota_reset_epoch=reset_epoch,
-            usage_24h=periods[1],
-            usage_7d=periods[7],
-            usage_30d=periods[30],
-            radar=radar,
-        )
+        def read_source(name: str, reader: Callable[[], Any]) -> Any:
+            started = time.monotonic()
+            try:
+                if cancelled.is_set():
+                    raise RuntimeError("refresh cancelled")
+                return reader()
+            finally:
+                print(f"Source {name} finished in {time.monotonic() - started:.2f}s", flush=True)
+
+        # Publish each source independently so a slow radar never holds up
+        # quota or usage data. Unfinished values stay explicitly unknown.
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {pool.submit(read_source, "Codex", read_codex): (0, "Codex")}
+            for bit, days in enumerate((1, 7, 30), start=1):
+                future = pool.submit(read_source, f"Vibe {days}d", lambda days=days: self._read_vibe_period(days))
+                futures[future] = (bit, f"Vibe {days}d")
+            radar_result = pool.submit(
+                read_source, "Radar", lambda: self._read_codex_radar(cancelled),
+            )
+            futures[radar_result] = (4, "Radar")
+            for future in as_completed(futures):
+                if cancelled.is_set():
+                    for pending in futures:
+                        pending.cancel()
+                    break
+                bit, name = futures[future]
+                fields: dict[str, Any] = {
+                    "fetched_epoch": int(time.time()),
+                    "pending_mask": snapshot.pending_mask & ~(1 << bit),
+                }
+                try:
+                    result = future.result()
+                    completed_at = fields["fetched_epoch"]
+                    if bit == 0:
+                        remaining, used, reset_epoch, five_hour_remaining, five_hour_reset_epoch = result
+                        fields.update(
+                            quota_remaining=remaining, quota_used=used, quota_reset_epoch=reset_epoch,
+                            quota_5h_remaining=five_hour_remaining, quota_5h_reset_epoch=five_hour_reset_epoch,
+                            codex_fetched_epoch=completed_at,
+                        )
+                    elif bit == 4:
+                        fields.update(radar=result, radar_fetched_epoch=completed_at)
+                    else:
+                        period_name, epoch_name = {
+                            1: ("usage_24h", "vibe24_fetched_epoch"),
+                            2: ("usage_7d", "vibe7_fetched_epoch"),
+                            3: ("usage_30d", "vibe30_fetched_epoch"),
+                        }[bit]
+                        fields.update({period_name: result, epoch_name: completed_at})
+                except Exception as error:
+                    print(f"{name} read failed: {error}", flush=True)
+                snapshot = replace(snapshot, **fields)
+                publish()
+
+        if cancelled.is_set():
+            return UsageSnapshot(host=host, fetched_epoch=int(time.time()))
         print(
             "Updated: "
             f"Codex 5H {snapshot.quota_5h_remaining}% / 7D {snapshot.quota_remaining}% left; "
@@ -687,19 +760,36 @@ def main() -> int:
     next_poll = 0.0
     next_wifi = 0.0
     started = time.monotonic()
-    collection_results: queue.Queue[tuple[bool, Any]] = queue.Queue()
+    collection_results: queue.Queue[tuple[int, str, Any]] = queue.Queue()
     collection_thread: threading.Thread | None = None
+    collection_cancel: threading.Event | None = None
+    collection_generation = 0
+    refresh_pending = False
+    was_awake = False
 
     def start_collection(previous: UsageSnapshot | None) -> None:
-        nonlocal collection_thread
-        if collection_thread and collection_thread.is_alive():
+        nonlocal collection_thread, collection_cancel, collection_generation, payload
+        if collection_thread is not None:
             return
+        collection_generation += 1
+        generation = collection_generation
+        cancel_event = threading.Event()
+        collection_cancel = cancel_event
+        # Old cached values must never satisfy this new refresh request.
+        payload = None
+
+        def progress(result: UsageSnapshot) -> None:
+            if not cancel_event.is_set():
+                collection_results.put((generation, "progress", result))
 
         def collect_in_background() -> None:
             try:
-                collection_results.put((True, collector.collect(previous)))
+                result = collector.collect(previous, on_progress=progress, cancel_event=cancel_event)
+                if not cancel_event.is_set():
+                    collection_results.put((generation, "done", result))
             except Exception as error:
-                collection_results.put((False, error))
+                if not cancel_event.is_set():
+                    collection_results.put((generation, "error", error))
 
         collection_thread = threading.Thread(target=collect_in_background, daemon=True)
         collection_thread.start()
@@ -709,54 +799,79 @@ def main() -> int:
             now = time.monotonic()
             collection_completed = False
 
+            if (collection_thread is not None and collection_cancel is not None
+                    and collection_cancel.is_set() and not collection_thread.is_alive()):
+                collection_thread = None
             try:
-                completed, result = collection_results.get_nowait()
+                generation, event, result = collection_results.get_nowait()
             except queue.Empty:
                 pass
             else:
-                collection_thread = None
-                if completed:
+                # Keep the first pending packet visible even when every
+                # source finishes within one main-loop tick. It identifies
+                # a new refresh even when Unix timestamps share a second.
+                valid_result = generation == collection_generation and not (
+                    collection_cancel and collection_cancel.is_set()
+                )
+                if not valid_result:
+                    event = "discarded"
+                if event in ("progress", "done"):
                     snapshot = result
                     payload = snapshot.wire_payload()
                     next_wifi = 0.0
-                    collection_completed = True
-                else:
+                    if event == "done":
+                        collection_completed = True
+                        collection_thread = None
+                elif event == "error":
+                    collection_thread = None
                     print(f"Metrics collection failed: {result}", flush=True)
 
-            collecting = bool(collection_thread and collection_thread.is_alive())
-            usb_refresh_requested = usb.tick(None if collecting else payload) if usb else False
+            usb_refresh_requested = usb.tick(None) if usb else False
             wifi_refresh_requested = wifi.poll(snapshot.host if snapshot else "") if wifi else False
             refresh_requested = usb_refresh_requested or wifi_refresh_requested
             if wifi_refresh_requested:
                 next_wifi = 0.0
-            if usb and usb.identified:
-                device_sleeping = not usb.screen_awake
-            elif wifi and wifi.screen_awake is not None:
-                device_sleeping = not wifi.screen_awake
-            else:
-                device_sleeping = bool(usb and not usb.screen_awake)
+            device_awake = bool(
+                usb.screen_awake if usb and usb.identified else wifi and wifi.screen_awake is True
+            )
+            collecting = collection_thread is not None
+            if device_awake and not was_awake:
+                refresh_pending = True
+            if refresh_requested and not collection_completed and (
+                not collecting or (collection_cancel is not None and collection_cancel.is_set())
+            ):
+                refresh_pending = True
+            was_awake = device_awake
+            if not device_awake and not args.once:
+                if collection_cancel:
+                    collection_cancel.set()
+                payload = None
             # Retry packets received while a collection ran are fulfilled by
             # that result. Deliver it before considering another collection.
-            if not device_sleeping and not collection_completed and (now >= next_poll or refresh_requested) and not (
-                collection_thread and collection_thread.is_alive()
+            if (device_awake or args.once) and not collection_completed and (now >= next_poll or refresh_pending) and not (
+                collection_thread is not None
             ):
                 start_collection(snapshot)
+                refresh_pending = False
                 next_poll = now + max(30, args.interval)
 
-            collecting = bool(collection_thread and collection_thread.is_alive())
-            if not device_sleeping and not collecting and wifi and payload and now >= next_wifi:
+            if device_awake and usb:
+                usb.send(payload)
+            if (device_awake or args.once) and wifi and payload and now >= next_wifi:
                 try:
                     wifi.send(payload)
                 except OSError as error:
                     print(f"Wi-Fi broadcast failed: {error}", flush=True)
                 next_wifi = now + max(3, args.wifi_interval)
 
-            if args.once and payload and now - started >= 7.0:
+            if args.once and payload and snapshot and snapshot.pending_mask == 0 and now - started >= 7.0:
                 return 0
             time.sleep(0.1)
     except KeyboardInterrupt:
         return 0
     finally:
+        if collection_cancel:
+            collection_cancel.set()
         if usb:
             usb.close()
         if wifi:

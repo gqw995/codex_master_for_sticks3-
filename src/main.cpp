@@ -25,7 +25,7 @@ constexpr uint32_t kPurple = 0xB178FF;
 constexpr uint16_t kUsagePort = 47322;
 constexpr uint32_t kUsbPriorityMs = 30000;
 constexpr uint32_t kWifiRetryMs = 30000;
-constexpr uint32_t kRefreshTimeoutMs = 60000;
+constexpr uint32_t kRefreshTimeoutMs = 12000;
 constexpr uint32_t kScreenTimeoutMs = 15000;
 constexpr uint32_t kBatteryPollMs = 2000;
 constexpr uint32_t kAutoRefreshDelayMs = 1500;
@@ -56,6 +56,9 @@ struct RadarModel {
 struct UsageSnapshot {
   String host;
   int64_t fetchedEpoch = 0;
+  uint8_t pendingMask = 0;
+  int64_t sourceEpochs[5] = {};
+  bool incremental = false;
   int16_t quota5hRemaining = -1;
   int64_t quota5hResetEpoch = 0;
   int16_t quotaRemaining = -1;
@@ -70,6 +73,9 @@ struct UsageSnapshot {
 Preferences prefs;
 M5PM1 powerController;
 bool powerControllerReady = false;
+m5::Button_Class powerButton;
+bool powerButtonArmed = false;
+uint32_t lastPowerButtonPoll = 0;
 UsageSnapshot usage;
 ScreenPage currentPage = ScreenPage::Codex;
 TimeRange currentRange = TimeRange::H24;
@@ -83,6 +89,8 @@ uint32_t lastWifiMillis = 0;
 RefreshState refreshState = RefreshState::Idle;
 uint32_t refreshStateMillis = 0;
 int64_t refreshAfterEpoch = 0;
+bool refreshResponseStarted = false;
+bool snapshotDirty = false;
 
 DNSServer dnsServer;
 WebServer webServer(80);
@@ -100,7 +108,8 @@ bool sideLongHandled = false;
 uint32_t frontPressedAt = 0;
 bool frontLongHandled = false;
 bool screenAwake = true;
-bool ignoreButtonsUntilReleased = false;
+bool frontButtonArmed = false;
+bool sideButtonArmed = false;
 bool autoRefreshPending = false;
 uint32_t autoRefreshStartedMillis = 0;
 uint32_t lastButtonActivityMillis = 0;
@@ -265,24 +274,33 @@ bool allSourcesAvailable() {
   return usage.radarCount > 0 && !usage.radarUpdated.endsWith(" OLD");
 }
 
+uint8_t pageSourceIndex() {
+  if (currentPage == ScreenPage::Codex) return 0;
+  if (currentPage == ScreenPage::Vibe) return 1 + static_cast<uint8_t>(currentRange);
+  return 4;
+}
+
+bool pageRefreshPending() {
+  return refreshState == RefreshState::Pending &&
+      (!refreshResponseStarted || (usage.pendingMask & (1 << pageSourceIndex())));
+}
+
 String refreshFooterText() {
-  if (refreshState == RefreshState::Pending) return "REFRESHING...";
+  if (pageRefreshPending()) return "REFRESHING...";
   if (!pageDataAvailable()) return "SOURCE ERROR";
   if (currentPage == ScreenPage::Radar && usage.radarUpdated.endsWith(" OLD")) return "SOURCE OLD";
-  if (refreshState == RefreshState::Success) return "REFRESH OK";
-  if (refreshState == RefreshState::Partial) return "REFRESH PARTIAL";
-  if (refreshState == RefreshState::Failed) return "REFRESH FAILED";
+  if (refreshState == RefreshState::Failed && !refreshResponseStarted) return "REFRESH FAILED";
+  if (refreshState != RefreshState::Idle) return "REFRESH OK";
   if (dataSource == DataSource::Cache) return "SAVED DATA";
   return sourceText() + " CONNECTED";
 }
 
 uint32_t refreshFooterColor() {
-  if (refreshState == RefreshState::Pending) return kBlue;
+  if (pageRefreshPending()) return kBlue;
   if (!pageDataAvailable()) return kRed;
-  if (refreshState == RefreshState::Partial ||
-      (currentPage == ScreenPage::Radar && usage.radarUpdated.endsWith(" OLD"))) return kAmber;
-  if (refreshState == RefreshState::Success) return kGreen;
-  if (refreshState == RefreshState::Failed) return kRed;
+  if (currentPage == ScreenPage::Radar && usage.radarUpdated.endsWith(" OLD")) return kAmber;
+  if (refreshState == RefreshState::Failed && !refreshResponseStarted) return kRed;
+  if (refreshState != RefreshState::Idle) return kGreen;
   return dataSource == DataSource::Cache ? kMuted : kGreen;
 }
 
@@ -294,7 +312,7 @@ void drawFooter(const String& radarUpdated = "") {
     M5.Display.drawString("RADAR " + radarUpdated, M5.Display.width() / 2, 207);
   }
   M5.Display.setTextColor(kMuted, kBackground);
-  M5.Display.drawString("UPDATED " + (pageDataAvailable() ? formatUpdateTime(usage.fetchedEpoch) : "--"),
+  M5.Display.drawString("UPDATED " + (pageDataAvailable() ? formatUpdateTime(usage.sourceEpochs[pageSourceIndex()]) : "--"),
                         M5.Display.width() / 2, 222);
   M5.Display.setTextColor(refreshFooterColor(), kBackground);
   M5.Display.drawString(refreshFooterText(), M5.Display.width() / 2, 237);
@@ -492,6 +510,8 @@ bool sendWifiControl(const String& event) {
   return delivered;
 }
 
+void saveSnapshot();
+
 void sleepScreen() {
   if (!screenAwake) return;
   // Restore the PM1 key's hardware wake/reset before the ESP stops polling it.
@@ -500,6 +520,7 @@ void sleepScreen() {
     lastButtonActivityMillis = millis();
     return;
   }
+  if (snapshotDirty) saveSnapshot();
   screenAwake = false;
   Serial.println("STICKS3_SCREEN,OFF");
   Serial.flush();
@@ -518,8 +539,7 @@ void sleepScreen() {
 }
 
 void serviceScreenTimeout() {
-  if (screenAwake && refreshState != RefreshState::Pending &&
-      millis() - lastButtonActivityMillis >= kScreenTimeoutMs) sleepScreen();
+  if (screenAwake && millis() - lastButtonActivityMillis >= kScreenTimeoutMs) sleepScreen();
 }
 
 void saveUiState() {
@@ -534,6 +554,9 @@ void saveSnapshot() {
   prefs.begin("usage-data", false);
   prefs.putString("host", usage.host);
   prefs.putLong64("fetched", usage.fetchedEpoch);
+  for (int i = 0; i < 5; ++i) {
+    prefs.putLong64((String("source") + i).c_str(), usage.sourceEpochs[i]);
+  }
   prefs.putInt("remain5h", usage.quota5hRemaining);
   prefs.putLong64("reset5h", usage.quota5hResetEpoch);
   prefs.putInt("remain", usage.quotaRemaining);
@@ -551,6 +574,7 @@ void saveSnapshot() {
   }
   prefs.putString("preferred", preferredHost);
   prefs.end();
+  snapshotDirty = false;
 }
 
 void loadState() {
@@ -563,6 +587,9 @@ void loadState() {
   prefs.begin("usage-data", false);
   usage.host = prefs.getString("host", "");
   usage.fetchedEpoch = prefs.getLong64("fetched", 0);
+  for (int i = 0; i < 5; ++i) {
+    usage.sourceEpochs[i] = prefs.getLong64((String("source") + i).c_str(), usage.fetchedEpoch);
+  }
   usage.quota5hRemaining = prefs.getInt("remain5h", -1);
   usage.quota5hResetEpoch = prefs.getLong64("reset5h", 0);
   usage.quotaRemaining = prefs.getInt("remain", -1);
@@ -591,10 +618,14 @@ void loadState() {
 
 bool sameSnapshot(const UsageSnapshot& left, const UsageSnapshot& right) {
   if (left.host != right.host || left.fetchedEpoch != right.fetchedEpoch ||
+      left.pendingMask != right.pendingMask || left.incremental != right.incremental ||
       left.quota5hRemaining != right.quota5hRemaining ||
       left.quota5hResetEpoch != right.quota5hResetEpoch ||
       left.quotaRemaining != right.quotaRemaining || left.quotaUsed != right.quotaUsed ||
       left.quotaResetEpoch != right.quotaResetEpoch) return false;
+  for (int i = 0; i < 5; ++i) {
+    if (left.sourceEpochs[i] != right.sourceEpochs[i]) return false;
+  }
   for (int i = 0; i < 3; ++i) {
     if (left.periods[i].costCents != right.periods[i].costCents ||
         left.periods[i].totalTokens != right.periods[i].totalTokens) return false;
@@ -611,20 +642,23 @@ bool parseUsageLine(const String& line, UsageSnapshot& parsed) {
   const bool isV2 = line.startsWith("USAGE2,");
   const bool isV3 = line.startsWith("USAGE3,");
   const bool isV4 = line.startsWith("USAGE4,");
-  if (!isV2 && !isV3 && !isV4) return false;
-  String fields[40];
+  const bool isV5 = line.startsWith("USAGE5,");
+  if (!isV2 && !isV3 && !isV4 && !isV5) return false;
+  String fields[46];
   int fieldIndex = 0;
   int start = 0;
-  for (int i = 0; i <= static_cast<int>(line.length()) && fieldIndex < 40; ++i) {
+  for (int i = 0; i <= static_cast<int>(line.length()) && fieldIndex < 46; ++i) {
     if (i == static_cast<int>(line.length()) || line[i] == ',') {
       fields[fieldIndex++] = line.substring(start, i);
       start = i + 1;
     }
   }
+  if (start != static_cast<int>(line.length()) + 1) return false;
   if (fieldIndex < 12 || fields[1].isEmpty()) return false;
   if (isV2 && (fieldIndex != 12 || fields[0] != "USAGE2")) return false;
   if (isV3 && (fieldIndex < 14 || fields[0] != "USAGE3")) return false;
   if (isV4 && (fieldIndex < 16 || fields[0] != "USAGE4")) return false;
+  if (isV5 && fieldIndex < 22) return false;
   parsed.host = fields[1];
   parsed.fetchedEpoch = strtoll(fields[2].c_str(), nullptr, 10);
   parsed.quotaRemaining = constrain(fields[3].toInt(), -1L, 100L);
@@ -635,9 +669,9 @@ bool parseUsageLine(const String& line, UsageSnapshot& parsed) {
     parsed.periods[i].totalTokens = strtoll(fields[7 + i * 2].c_str(), nullptr, 10);
   }
 
-  if (isV3 || isV4) {
+  if (isV3 || isV4 || isV5) {
     const int radarCount = fields[13].toInt();
-    const int expectedFields = 14 + radarCount * 2 + (isV4 ? 2 : 0);
+    const int expectedFields = 14 + radarCount * 2 + (isV5 ? 8 : isV4 ? 2 : 0);
     if (radarCount < 0 || radarCount > kMaxRadarModels || fieldIndex != expectedFields) return false;
     parsed.radarUpdated = fields[12];
     parsed.radarCount = radarCount;
@@ -645,10 +679,19 @@ bool parseUsageLine(const String& line, UsageSnapshot& parsed) {
       parsed.radarModels[i].name = fields[14 + i * 2];
       parsed.radarModels[i].scoreTenths = static_cast<int16_t>(fields[15 + i * 2].toInt());
     }
-    if (isV4) {
+    if (isV4 || isV5) {
       const int quota5hIndex = 14 + radarCount * 2;
       parsed.quota5hRemaining = constrain(fields[quota5hIndex].toInt(), -1L, 100L);
       parsed.quota5hResetEpoch = strtoll(fields[quota5hIndex + 1].c_str(), nullptr, 10);
+      if (isV5) {
+        const int pending = fields[quota5hIndex + 2].toInt();
+        if (pending < 0 || pending > 31) return false;
+        parsed.pendingMask = pending;
+        parsed.incremental = true;
+        for (int i = 0; i < 5; ++i) {
+          parsed.sourceEpochs[i] = strtoll(fields[quota5hIndex + 3 + i].c_str(), nullptr, 10);
+        }
+      }
     } else {
       parsed.quota5hRemaining = usage.quota5hRemaining;
       parsed.quota5hResetEpoch = usage.quota5hResetEpoch;
@@ -662,6 +705,9 @@ bool parseUsageLine(const String& line, UsageSnapshot& parsed) {
     parsed.quota5hRemaining = usage.quota5hRemaining;
     parsed.quota5hResetEpoch = usage.quota5hResetEpoch;
   }
+  if (!isV5) {
+    for (int i = 0; i < 5; ++i) parsed.sourceEpochs[i] = parsed.fetchedEpoch;
+  }
   return parsed.fetchedEpoch > 0;
 }
 
@@ -670,6 +716,7 @@ void requestRefresh() {
   refreshState = RefreshState::Pending;
   refreshStateMillis = now;
   refreshAfterEpoch = usage.fetchedEpoch;
+  refreshResponseStarted = false;
   lastButtonActivityMillis = now;
   lastWifiRefreshRequestMillis = 0;
   Serial.println("STICKS3_REFRESH");
@@ -693,26 +740,41 @@ bool applyUsageLine(const String& line, DataSource incomingSource) {
 
   const bool newSnapshot = parsed.fetchedEpoch != usage.fetchedEpoch || dataSource == DataSource::Cache;
   const bool changed = !sameSnapshot(usage, parsed) || dataSource != incomingSource;
+  // The bridge may start on USB identification before our wake timer fires.
+  if (parsed.incremental && parsed.pendingMask) autoRefreshPending = false;
+  if (parsed.pendingMask && refreshState != RefreshState::Pending) {
+    refreshState = RefreshState::Pending;
+    refreshStateMillis = now;
+    refreshAfterEpoch = usage.fetchedEpoch;
+    refreshResponseStarted = false;
+  }
+  const bool freshResponse = parsed.fetchedEpoch > refreshAfterEpoch ||
+      (parsed.incremental && (parsed.pendingMask || refreshResponseStarted));
+  if (refreshState == RefreshState::Pending && freshResponse) refreshResponseStarted = true;
   usage = parsed;
   if (currentRadarPage >= radarPageCount()) currentRadarPage = 0;
   dataSource = incomingSource;
   if (newSnapshot) snapshotMillis = now;
-  const bool refreshCompleted = refreshState == RefreshState::Pending && parsed.fetchedEpoch > refreshAfterEpoch;
+  const bool refreshCompleted = refreshState == RefreshState::Pending &&
+      refreshResponseStarted && parsed.pendingMask == 0;
   if (refreshCompleted) {
     refreshState = allSourcesAvailable() ? RefreshState::Success : RefreshState::Partial;
     refreshStateMillis = now;
-    lastButtonActivityMillis = now;
   }
   if (changed || refreshCompleted) {
-    if (changed) saveSnapshot();
+    snapshotDirty = snapshotDirty || changed;
+    // Persist once at sleep, keeping flash writes out of interactive refresh.
     drawScreen();
   }
+  Serial.printf("STICKS3_DATA,PENDING=%u,PAGE=%d,READY=%d\n", usage.pendingMask,
+                static_cast<int>(currentPage), pageDataAvailable());
   if (incomingSource == DataSource::Usb) Serial.println("USAGE_ACK");
   return true;
 }
 
 void readSerial() {
-  while (Serial.available()) {
+  int bytesRead = 0;
+  while (Serial.available() && bytesRead++ < 256) {
     const char ch = static_cast<char>(Serial.read());
     if (ch == '\n') {
       serialLine.trim();
@@ -820,7 +882,8 @@ void serviceWifi() {
 
   if (!udpRunning) return;
   int packetSize = usageUdp.parsePacket();
-  while (packetSize > 0) {
+  int packetsRead = 0;
+  while (packetSize > 0 && packetsRead++ < 4) {
     char packet[800];
     const int count = usageUdp.read(packet, sizeof(packet) - 1);
     if (count > 0) {
@@ -833,7 +896,7 @@ void serviceWifi() {
   }
 
   const uint32_t now = millis();
-  if (refreshState == RefreshState::Pending &&
+  if (refreshState == RefreshState::Pending && !refreshResponseStarted &&
       now - lastWifiRefreshRequestMillis >= kWifiControlRetryMs &&
       sendWifiControl("STICKS3_REFRESH")) {
     lastWifiRefreshRequestMillis = now;
@@ -854,27 +917,41 @@ void switchPage() {
   drawScreen();
 }
 
-void handleButtons() {
+void servicePowerButton() {
   const uint32_t now = millis();
-  if (ignoreButtonsUntilReleased) {
-    lastButtonActivityMillis = now;
-    if (digitalRead(kFrontButtonPin) == HIGH && digitalRead(kSideButtonPin) == HIGH) {
-      ignoreButtonsUntilReleased = false;
-    }
+  if (!powerControllerReady || now - lastPowerButtonPoll < 10) return;
+  lastPowerButtonPoll = now;
+  bool pressed = false;
+  if (powerController.btnGetState(&pressed) != M5PM1_OK) return;
+  powerButton.setRawState(now, pressed);
+  if (!powerButtonArmed) {
+    if (!pressed && powerButton.isReleased()) powerButtonArmed = true;
     return;
   }
-
-  if (M5.BtnPWR.wasClicked()) {
+  if (powerButton.wasPressed()) Serial.println("STICKS3_BUTTON,PWR_DOWN");
+  if (powerButton.wasReleased()) Serial.println("STICKS3_BUTTON,PWR_UP");
+  if (powerButton.isPressed()) lastButtonActivityMillis = now;
+  // Process the click only in this fresh-sample call, never twice between polls.
+  if (powerButton.wasClicked()) {
     Serial.println("STICKS3_BUTTON,PWR_CLICK");
     switchPage();
   }
-  if (M5.BtnB.wasPressed()) {
+}
+
+void handleButtons() {
+  const uint32_t now = millis();
+  servicePowerButton();
+  const bool handleFront = frontButtonArmed;
+  const bool handleSide = sideButtonArmed;
+  if (!frontButtonArmed && M5.BtnA.isReleased() && digitalRead(kFrontButtonPin) == HIGH) frontButtonArmed = true;
+  if (!sideButtonArmed && M5.BtnB.isReleased() && digitalRead(kSideButtonPin) == HIGH) sideButtonArmed = true;
+  if (handleSide && M5.BtnB.wasPressed()) {
     Serial.println("STICKS3_BUTTON,KEY2_DOWN");
     lastButtonActivityMillis = now;
     sidePressedAt = now;
     sideLongHandled = false;
   }
-  if (M5.BtnA.wasPressed()) {
+  if (handleFront && M5.BtnA.wasPressed()) {
     lastButtonActivityMillis = now;
     frontPressedAt = now;
     frontLongHandled = false;
@@ -883,7 +960,7 @@ void handleButtons() {
     lastButtonActivityMillis = now;
   }
 
-  if (M5.BtnB.isPressed() && sidePressedAt != 0 && !sideLongHandled &&
+  if (handleSide && M5.BtnB.isPressed() && sidePressedAt != 0 && !sideLongHandled &&
       now - sidePressedAt >= 1200) {
     sideLongHandled = true;
     provisioningScreen = true;
@@ -891,7 +968,7 @@ void handleButtons() {
     else startPortal();
     drawScreen();
   }
-  if (M5.BtnB.wasReleased()) {
+  if (handleSide && M5.BtnB.wasReleased()) {
     Serial.println("STICKS3_BUTTON,KEY2_UP");
     if (!sideLongHandled) {
       switchPage();
@@ -901,18 +978,18 @@ void handleButtons() {
   }
 
   if (provisioningScreen) {
-    if (M5.BtnA.wasReleased()) {
+    if (handleFront && M5.BtnA.wasReleased()) {
       frontPressedAt = 0;
       frontLongHandled = false;
     }
     return;
   }
-  if (M5.BtnA.isPressed() && frontPressedAt != 0 && !frontLongHandled &&
+  if (handleFront && M5.BtnA.isPressed() && frontPressedAt != 0 && !frontLongHandled &&
       now - frontPressedAt >= 1200) {
     frontLongHandled = true;
     requestRefresh();
   }
-  if (M5.BtnA.wasReleased()) {
+  if (handleFront && M5.BtnA.wasReleased()) {
     if (!frontLongHandled) {
       if (currentPage == ScreenPage::Vibe) {
         currentRange = static_cast<TimeRange>((static_cast<int>(currentRange) + 1) % 3);
@@ -932,7 +1009,7 @@ void handleButtons() {
 }  // namespace
 
 void setup() {
-  // A full USAGE4 payload with 12 radar models is larger than the ESP32-S3
+  // A full USAGE5 payload with 12 radar models is larger than the ESP32-S3
   // HW CDC default 256-byte RX queue. Allocate this before M5.begin() calls
   // Serial.begin(), otherwise the tail (including the newline) can be lost.
   Serial.setRxBufferSize(1024);
@@ -942,17 +1019,17 @@ void setup() {
   config.internal_imu = false;
   config.internal_mic = false;
   config.internal_spk = false;
+  config.pmic_button = false; // Read PM1 physical state via its official driver below.
   M5.begin(config);
+  Serial.setTxTimeoutMs(5);
   powerControllerReady = powerController.begin(&M5.In_I2C) == M5PM1_OK;
   const bool powerKeyNavigation = powerControllerReady &&
       powerController.setSingleResetDisable(true) == M5PM1_OK;
-  // Consume the power-on/wake click; it must not also change pages.
-  M5.Power.getKeyState();
+  powerButton.setHoldThresh(1200);
   M5.Power.setBatteryCharge(true);
   M5.Display.setRotation(0);
   M5.Display.setBrightness(kDisplayBrightness);
   loadState();
-  ignoreButtonsUntilReleased = wokeByButton;
   autoRefreshPending = true;
   autoRefreshStartedMillis = millis();
   lastButtonActivityMillis = millis();
@@ -962,7 +1039,7 @@ void setup() {
   if (savedSsid.isEmpty()) startPortal();
   else connectWifi();
   Serial.println("STICKS3_READY");
-  Serial.printf("STICKS3_STATUS,FW=weekly-sidekey,BOARD=%d,BAT=%d,WAKE=%d,CHG=%d,RESET=%d,PAGE=%d,PWR_NAV=%d\n",
+  Serial.printf("STICKS3_STATUS,FW=responsive-v5,BOARD=%d,BAT=%d,WAKE=%d,CHG=%d,RESET=%d,PAGE=%d,PWR_NAV=%d\n",
                 static_cast<int>(M5.getBoard()), cachedBatteryLevel, wokeByButton,
                 static_cast<int>(M5.Power.isCharging()), static_cast<int>(esp_reset_reason()),
                 static_cast<int>(currentPage), powerKeyNavigation);
@@ -970,9 +1047,9 @@ void setup() {
 
 void loop() {
   M5.update();
+  handleButtons();
   readSerial();
   serviceWifi();
-  handleButtons();
   serviceBattery();
   if (autoRefreshPending && millis() - autoRefreshStartedMillis >= kAutoRefreshDelayMs) {
     autoRefreshPending = false;
@@ -982,8 +1059,8 @@ void loop() {
 
   if (refreshState == RefreshState::Pending && millis() - refreshStateMillis >= kRefreshTimeoutMs) {
     refreshState = RefreshState::Failed;
+    usage.pendingMask = 0;
     refreshStateMillis = millis();
-    lastButtonActivityMillis = refreshStateMillis;
     drawScreen();
   } else if ((refreshState == RefreshState::Success || refreshState == RefreshState::Failed ||
               refreshState == RefreshState::Partial) &&
