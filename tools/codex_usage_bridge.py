@@ -227,6 +227,9 @@ class UsbHotplugManager:
                     refresh_requested = True
                 elif line == "STICKS3_REFRESH_DONE":
                     print("Stick S3 confirmed refresh response", flush=True)
+                elif line.startswith(("STICKS3_STATUS,", "STICKS3_BUTTON,", "STICKS3_PAGE,",
+                                      "STICKS3_POWER,", "STICKS3_BATTERY,")):
+                    print(line, flush=True)
                 elif line == "USAGE_ACK":
                     now = time.monotonic()
                     if self.last_ack_log == 0.0 or now - self.last_ack_log >= 300.0:

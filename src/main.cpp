@@ -1,11 +1,13 @@
 #include <Arduino.h>
 #include <DNSServer.h>
 #include <M5Unified.h>
+#include <M5PM1.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <esp_sleep.h>
+#include <esp_system.h>
 #include <time.h>
 
 namespace {
@@ -25,11 +27,11 @@ constexpr uint32_t kUsbPriorityMs = 30000;
 constexpr uint32_t kWifiRetryMs = 30000;
 constexpr uint32_t kRefreshTimeoutMs = 60000;
 constexpr uint32_t kScreenTimeoutMs = 15000;
-constexpr uint32_t kBatteryPollMs = 15000;
+constexpr uint32_t kBatteryPollMs = 2000;
 constexpr uint32_t kAutoRefreshDelayMs = 1500;
 constexpr uint32_t kWifiControlRetryMs = 1000;
 constexpr int64_t kTimezoneOffsetSeconds = 8 * 60 * 60;
-constexpr uint8_t kDisplayBrightness = 80;
+constexpr uint8_t kDisplayBrightness = 255 * 80 / 100;
 constexpr gpio_num_t kFrontButtonPin = GPIO_NUM_11;
 constexpr gpio_num_t kSideButtonPin = GPIO_NUM_12;
 constexpr uint64_t kButtonWakeMask = (1ULL << kFrontButtonPin) | (1ULL << kSideButtonPin);
@@ -66,6 +68,8 @@ struct UsageSnapshot {
 };
 
 Preferences prefs;
+M5PM1 powerController;
+bool powerControllerReady = false;
 UsageSnapshot usage;
 ScreenPage currentPage = ScreenPage::Codex;
 TimeRange currentRange = TimeRange::H24;
@@ -209,28 +213,43 @@ int batteryLevel() {
   return cachedBatteryLevel;
 }
 
-void drawHeader(const String& title, uint32_t titleColor) {
-  const int level = batteryLevel();
+void drawBatteryIcon() {
+  const int level = cachedBatteryLevel;
   const uint32_t batteryColor = level < 0 ? kMuted : colorForRemaining(level);
-
-  M5.Display.setTextSize(1.0f, 1.0f);
-  M5.Display.setTextFont(1);
-  M5.Display.setTextDatum(top_left);
-  M5.Display.setTextColor(titleColor, kBackground);
-  M5.Display.drawString(title, 8, 8);
-
-  M5.Display.setTextColor(batteryColor, kBackground);
   const int iconX = M5.Display.width() - 22;
+  M5.Display.fillRect(iconX, 6, 21, 12, kBackground);
   M5.Display.drawRect(iconX, 7, 18, 10, batteryColor);
   M5.Display.fillRect(iconX + 18, 10, 2, 4, batteryColor);
+  if (level < 0) {
+    // Unknown is not an empty battery.
+    M5.Display.drawLine(iconX + 3, 14, iconX + 14, 9, kMuted);
+    return;
+  }
   const int segmentCount = level <= 0 ? 0 : min(4, (level + 24) / 25);
   for (int segment = 0; segment < segmentCount; ++segment) {
     M5.Display.fillRect(iconX + 2 + segment * 4, 9, 3, 6, batteryColor);
   }
 }
 
+void drawHeader(const String& title, uint32_t titleColor) {
+  M5.Display.setTextSize(1.0f, 1.0f);
+  M5.Display.setTextFont(1);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(titleColor, kBackground);
+  M5.Display.drawString(title, 8, 8);
+  drawBatteryIcon();
+}
+
+void serviceBattery() {
+  if (!screenAwake || millis() - batteryReadMillis < kBatteryPollMs) return;
+  batteryLevel();
+  if (!provisioningScreen) drawBatteryIcon();
+  Serial.printf("STICKS3_BATTERY,LEVEL=%d,MV=%d,CHG=%d\n", cachedBatteryLevel,
+                M5.Power.getBatteryVoltage(), static_cast<int>(M5.Power.isCharging()));
+}
+
 bool pageDataAvailable() {
-  if (currentPage == ScreenPage::Codex) return usage.quotaRemaining >= 0 || usage.quota5hRemaining >= 0;
+  if (currentPage == ScreenPage::Codex) return usage.quotaRemaining >= 0;
   if (currentPage == ScreenPage::Vibe) {
     const PeriodUsage& selected = usage.periods[static_cast<int>(currentRange)];
     return selected.costCents >= 0 && selected.totalTokens >= 0;
@@ -239,7 +258,7 @@ bool pageDataAvailable() {
 }
 
 bool allSourcesAvailable() {
-  if (usage.quotaRemaining < 0 && usage.quota5hRemaining < 0) return false;
+  if (usage.quotaRemaining < 0) return false;
   for (const PeriodUsage& period : usage.periods) {
     if (period.costCents < 0 || period.totalTokens < 0) return false;
   }
@@ -281,29 +300,30 @@ void drawFooter(const String& radarUpdated = "") {
   M5.Display.drawString(refreshFooterText(), M5.Display.width() / 2, 237);
 }
 
-void drawQuotaCard(int y, const String& label, int remaining, int64_t resetEpoch) {
+void drawCodexScreen() {
+  drawHeader("CODEX", kBlue);
+  const int remaining = usage.quotaRemaining;
   const uint32_t accent = remaining < 0 ? kMuted : colorForRemaining(remaining);
-  M5.Display.fillRoundRect(8, y, M5.Display.width() - 16, 73, 9, kPanel);
+  M5.Display.fillRoundRect(8, 35, M5.Display.width() - 16, 155, 9, kPanel);
 
   M5.Display.setTextDatum(top_center);
   M5.Display.setTextFont(1);
   M5.Display.setTextColor(kMuted, kPanel);
-  M5.Display.drawString(label + " LEFT", M5.Display.width() / 2, y + 5);
-  const String resetText = remaining < 0 ? "NOT REPORTED" :
-      (remaining >= 100 && resetEpoch <= 0 ? "READY" : "RESET IN " + countdownText(resetEpoch));
-  M5.Display.drawString(resetText, M5.Display.width() / 2, y + 16);
+  M5.Display.drawString("WEEKLY LEFT", M5.Display.width() / 2, 48);
 
   M5.Display.setTextFont(4);
+  M5.Display.setTextSize(1.5f, 1.5f);
   M5.Display.setTextColor(accent, kPanel);
-  M5.Display.drawString(remaining < 0 ? "--" : String(remaining) + "%", M5.Display.width() / 2,
-                        y + 29);
-  drawProgressBar(16, y + 60, M5.Display.width() - 32, 7, max(0, remaining), accent);
-}
+  M5.Display.drawString(remaining < 0 ? "--" : String(remaining) + "%", M5.Display.width() / 2, 70);
+  M5.Display.setTextSize(1.0f, 1.0f);
+  drawProgressBar(18, 116, M5.Display.width() - 36, 9, max(0, remaining), accent);
 
-void drawCodexScreen() {
-  drawHeader("CODEX", kBlue);
-  drawQuotaCard(27, "5H", usage.quota5hRemaining, usage.quota5hResetEpoch);
-  drawQuotaCard(106, "7D", usage.quotaRemaining, usage.quotaResetEpoch);
+  M5.Display.setTextFont(1);
+  M5.Display.setTextColor(kMuted, kPanel);
+  M5.Display.drawString(remaining < 0 ? "NOT REPORTED" : "RESETS IN", M5.Display.width() / 2, 143);
+  M5.Display.setTextColor(kWhite, kPanel);
+  M5.Display.drawString(remaining < 0 ? "--" : countdownText(usage.quotaResetEpoch),
+                        M5.Display.width() / 2, 163);
   drawFooter();
 }
 
@@ -474,6 +494,12 @@ bool sendWifiControl(const String& event) {
 
 void sleepScreen() {
   if (!screenAwake) return;
+  // Restore the PM1 key's hardware wake/reset before the ESP stops polling it.
+  if (powerControllerReady && powerController.setSingleResetDisable(false) != M5PM1_OK) {
+    Serial.println("STICKS3_POWER,RESET_WAKE_RESTORE_FAILED");
+    lastButtonActivityMillis = millis();
+    return;
+  }
   screenAwake = false;
   Serial.println("STICKS3_SCREEN,OFF");
   Serial.flush();
@@ -482,6 +508,11 @@ void sleepScreen() {
   WiFi.mode(WIFI_OFF);
   M5.Display.sleep();
   M5.Display.waitDisplay();
+  // Official StickS3 L3B rail: LCD backlight, microphone and speaker.
+  M5.Power.M5pm1.setGPIOFunction(m5::M5PM1_Class::gpio2, m5::M5PM1_Class::gpio);
+  M5.Power.M5pm1.setGPIOMode(m5::M5PM1_Class::gpio2, m5::M5PM1_Class::output);
+  M5.Power.M5pm1.setGPIODrive(m5::M5PM1_Class::gpio2, m5::M5PM1_Class::push_pull);
+  M5.Power.M5pm1.setGPIOOutput(m5::M5PM1_Class::gpio2, false);
   esp_sleep_enable_ext1_wakeup(kButtonWakeMask, ESP_EXT1_WAKEUP_ANY_LOW);
   esp_deep_sleep_start();
 }
@@ -809,6 +840,20 @@ void serviceWifi() {
   }
 }
 
+void switchPage() {
+  lastButtonActivityMillis = millis();
+  if (provisioningScreen) {
+    provisioningScreen = false;
+    stopPortal();
+    if (!savedSsid.isEmpty() && WiFi.status() != WL_CONNECTED) connectWifi();
+  } else {
+    currentPage = static_cast<ScreenPage>((static_cast<int>(currentPage) + 1) % 3);
+    saveUiState();
+  }
+  Serial.printf("STICKS3_PAGE,%d\n", static_cast<int>(currentPage));
+  drawScreen();
+}
+
 void handleButtons() {
   const uint32_t now = millis();
   if (ignoreButtonsUntilReleased) {
@@ -819,7 +864,12 @@ void handleButtons() {
     return;
   }
 
+  if (M5.BtnPWR.wasClicked()) {
+    Serial.println("STICKS3_BUTTON,PWR_CLICK");
+    switchPage();
+  }
   if (M5.BtnB.wasPressed()) {
+    Serial.println("STICKS3_BUTTON,KEY2_DOWN");
     lastButtonActivityMillis = now;
     sidePressedAt = now;
     sideLongHandled = false;
@@ -842,16 +892,9 @@ void handleButtons() {
     drawScreen();
   }
   if (M5.BtnB.wasReleased()) {
+    Serial.println("STICKS3_BUTTON,KEY2_UP");
     if (!sideLongHandled) {
-      if (provisioningScreen) {
-        provisioningScreen = false;
-        stopPortal();
-        if (!savedSsid.isEmpty() && WiFi.status() != WL_CONNECTED) connectWifi();
-      } else {
-        currentPage = static_cast<ScreenPage>((static_cast<int>(currentPage) + 1) % 3);
-        saveUiState();
-      }
-      drawScreen();
+      switchPage();
     }
     sidePressedAt = 0;
     sideLongHandled = false;
@@ -900,22 +943,29 @@ void setup() {
   config.internal_mic = false;
   config.internal_spk = false;
   M5.begin(config);
+  powerControllerReady = powerController.begin(&M5.In_I2C) == M5PM1_OK;
+  const bool powerKeyNavigation = powerControllerReady &&
+      powerController.setSingleResetDisable(true) == M5PM1_OK;
+  // Consume the power-on/wake click; it must not also change pages.
+  M5.Power.getKeyState();
   M5.Power.setBatteryCharge(true);
   M5.Display.setRotation(0);
   M5.Display.setBrightness(kDisplayBrightness);
   loadState();
   ignoreButtonsUntilReleased = wokeByButton;
-  autoRefreshPending = wokeByButton;
+  autoRefreshPending = true;
   autoRefreshStartedMillis = millis();
   lastButtonActivityMillis = millis();
+  batteryLevel();
   drawScreen();
 
   if (savedSsid.isEmpty()) startPortal();
   else connectWifi();
   Serial.println("STICKS3_READY");
-  Serial.printf("STICKS3_STATUS,BOARD=%d,BAT=%d,WAKE=%d,CHG=%d\n",
+  Serial.printf("STICKS3_STATUS,FW=weekly-sidekey,BOARD=%d,BAT=%d,WAKE=%d,CHG=%d,RESET=%d,PAGE=%d,PWR_NAV=%d\n",
                 static_cast<int>(M5.getBoard()), cachedBatteryLevel, wokeByButton,
-                static_cast<int>(M5.Power.isCharging()));
+                static_cast<int>(M5.Power.isCharging()), static_cast<int>(esp_reset_reason()),
+                static_cast<int>(currentPage), powerKeyNavigation);
 }
 
 void loop() {
@@ -923,6 +973,7 @@ void loop() {
   readSerial();
   serviceWifi();
   handleButtons();
+  serviceBattery();
   if (autoRefreshPending && millis() - autoRefreshStartedMillis >= kAutoRefreshDelayMs) {
     autoRefreshPending = false;
     requestRefresh();
