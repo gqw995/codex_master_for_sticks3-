@@ -76,6 +76,21 @@ struct UsageSnapshot {
 Preferences prefs;
 M5PM1 powerController;
 bool powerControllerReady = false;
+struct PowerDiagnostics {
+  uint32_t uptimeMs;
+  uint16_t vbat, vin, vref;
+  uint8_t config, chargeStatus;
+  m5pm1_pwr_src_t source;
+  m5pm1_err_t vbatError, vinError, vrefError, configError, chargeError, sourceError;
+};
+
+PowerDiagnostics bootPowerBeforeEnable = {};
+PowerDiagnostics bootPowerAfterEnable = {};
+RTC_DATA_ATTR PowerDiagnostics lastSleepPower = {};
+RTC_DATA_ATTR uint32_t lastSleepPowerMagic = 0;
+constexpr uint32_t kPowerDiagnosticsMagic = 0x504F5731;
+bool bootPowerDiagnosticsPending = true;
+bool lastSleepPowerAvailable = false;
 m5::Button_Class powerButton;
 bool powerButtonArmed = false;
 uint32_t lastPowerButtonPoll = 0;
@@ -252,12 +267,52 @@ void drawHeader(const String& title, uint32_t titleColor) {
   drawBatteryIcon();
 }
 
+PowerDiagnostics readPowerDiagnostics() {
+  PowerDiagnostics data = {};
+  data.uptimeMs = millis();
+  // Official read-only APIs return an error separately from each measurement.
+  data.vbatError = powerController.readVbat(&data.vbat);
+  data.vinError = powerController.readVin(&data.vin);
+  data.vrefError = powerController.readVref(&data.vref);
+  data.sourceError = powerController.getPowerSource(&data.source);
+  data.configError = powerController.getPowerConfig(&data.config);
+  data.chargeError = powerController.gpioGetInput(M5PM1_GPIO_NUM_0, &data.chargeStatus);
+  return data;
+}
+
+void logPowerDiagnostics(const char* phase, const PowerDiagnostics& data) {
+  // PWR_SRC is a bitmap: bit0=5VIN, bit1=5VINOUT, bit2=VBAT node powered.
+  // Keep the raw value: M5PM1 1.0.7's source enum is incorrect. CHG_STAT is active-low.
+  // Failed reads are unknown (-1), never interpreted as zero volts or charging.
+  Serial.printf("STICKS3_POWER,PHASE=%s,UP_MS=%lu,VBAT=%d,VBAT_ERR=%d,VIN=%d,VIN_ERR=%d,"
+                "VREF=%d,VREF_ERR=%d,SRC=%d,SRC_ERR=%d,CFG=%d,CFG_ERR=%d,CHG_EN=%d,"
+                "CHG_STAT=%d,CHG_ERR=%d,BOOST_EN=%d\n", phase, static_cast<unsigned long>(data.uptimeMs),
+                data.vbatError == M5PM1_OK ? data.vbat : -1, data.vbatError,
+                data.vinError == M5PM1_OK ? data.vin : -1, data.vinError,
+                data.vrefError == M5PM1_OK ? data.vref : -1, data.vrefError,
+                data.sourceError == M5PM1_OK ? static_cast<int>(data.source) : -1, data.sourceError,
+                data.configError == M5PM1_OK ? data.config : -1, data.configError,
+                data.configError == M5PM1_OK ? !!(data.config & M5PM1_PWR_CFG_CHG_EN) : -1,
+                data.chargeError == M5PM1_OK ? data.chargeStatus : -1, data.chargeError,
+                data.configError == M5PM1_OK ? !!(data.config & M5PM1_PWR_CFG_BOOST_EN) : -1);
+}
+
 void serviceBattery() {
   if (!screenAwake || millis() - batteryReadMillis < kBatteryPollMs) return;
   batteryLevel();
   if (!provisioningScreen) drawBatteryIcon();
   Serial.printf("STICKS3_BATTERY,LEVEL=%d,MV=%d,CHG=%d\n", cachedBatteryLevel,
                 M5.Power.getBatteryVoltage(), static_cast<int>(M5.Power.isCharging()));
+  if (Serial) {
+    // USB may enumerate after setup; retain boot readings until it is connected.
+    if (bootPowerDiagnosticsPending) {
+      if (lastSleepPowerAvailable) logPowerDiagnostics("LAST_SLEEP_L3B_OFF", lastSleepPower);
+      logPowerDiagnostics("BOOT_BEFORE_ENABLE", bootPowerBeforeEnable);
+      logPowerDiagnostics("BOOT_AFTER_ENABLE", bootPowerAfterEnable);
+      bootPowerDiagnosticsPending = false;
+    }
+    logPowerDiagnostics("AWAKE", readPowerDiagnostics());
+  }
 }
 
 bool pageDataAvailable() {
@@ -548,6 +603,12 @@ void sleepScreen() {
   M5.Power.M5pm1.setGPIOMode(m5::M5PM1_Class::gpio2, m5::M5PM1_Class::output);
   M5.Power.M5pm1.setGPIODrive(m5::M5PM1_Class::gpio2, m5::M5PM1_Class::push_pull);
   M5.Power.M5pm1.setGPIOOutput(m5::M5PM1_Class::gpio2, false);
+  lastSleepPower = readPowerDiagnostics();
+  lastSleepPowerMagic = kPowerDiagnosticsMagic;
+  if (Serial) {
+    logPowerDiagnostics("SLEEP_L3B_OFF", lastSleepPower);
+    Serial.flush();
+  }
   esp_sleep_enable_ext1_wakeup(kButtonWakeMask, ESP_EXT1_WAKEUP_ANY_LOW);
   esp_deep_sleep_start();
 }
@@ -1057,6 +1118,7 @@ void setup() {
   config.internal_imu = false;
   config.internal_mic = false;
   config.internal_spk = false;
+  config.output_power = false; // No Grove/HAT/IR peripherals need the external 5V boost.
   config.pmic_button = false; // Read PM1 physical state via its official driver below.
   M5.begin(config);
   Serial.setTxTimeoutMs(5);
@@ -1064,7 +1126,12 @@ void setup() {
   const bool powerKeyNavigation = powerControllerReady &&
       powerController.setSingleResetDisable(true) == M5PM1_OK;
   powerButton.setHoldThresh(1200);
+  lastSleepPowerAvailable = esp_reset_reason() == ESP_RST_DEEPSLEEP &&
+      lastSleepPowerMagic == kPowerDiagnosticsMagic;
+  // StickS3 M5.begin() configures peripheral rails, but does not enable charging.
+  bootPowerBeforeEnable = readPowerDiagnostics();
   M5.Power.setBatteryCharge(true);
+  bootPowerAfterEnable = readPowerDiagnostics();
   M5.Display.setRotation(0);
   M5.Display.setBrightness(kDisplayBrightness);
   loadState();
@@ -1077,7 +1144,7 @@ void setup() {
   if (savedSsid.isEmpty()) startPortal();
   else connectWifi();
   Serial.println("STICKS3_READY");
-  Serial.printf("STICKS3_STATUS,FW=radar-bench-v1,BOARD=%d,BAT=%d,WAKE=%d,CHG=%d,RESET=%d,PAGE=%d,PWR_NAV=%d\n",
+  Serial.printf("STICKS3_STATUS,FW=battery-no-boost-v1,BOARD=%d,BAT=%d,WAKE=%d,CHG=%d,RESET=%d,PAGE=%d,PWR_NAV=%d\n",
                 static_cast<int>(M5.getBoard()), cachedBatteryLevel, wokeByButton,
                 static_cast<int>(M5.Power.isCharging()), static_cast<int>(esp_reset_reason()),
                 static_cast<int>(currentPage), powerKeyNavigation);
