@@ -4,13 +4,13 @@ CodeX Master 是运行在 M5Stack StickS3 上的个人 AI 编程用量显示器�
 
 - Codex 每周剩余额度及重置倒计时。
 - Vibe Usage 的 24 小时、7 天、30 天预估费用和总 Token。
-- Codex 雷达“智力效率”的模型最新分数和网站更新时间。
+- Codex 雷达“雷达Bench v1”的总雷达分前 6 名和源数据更新时间，每组显示 3 项。
 - USB 热插拔、Wi-Fi 备用连接和多台 Mac 自动切换。
 - 右上角四档设备电量图标、80% 亮度和统一的数据更新时间。
 - 15 秒无按键后进入低功耗睡眠，按键唤醒后通过 USB 或 Wi-Fi 自动刷新。
 - 各来源完成后立即更新对应页面，慢速雷达请求不再拖住 Codex 和 Vibe；刷新期间可切页。
 
-额度只显示普通 Codex 的每周窗口，不显示 5 小时卡片；账户未返回每周窗口时显示 `-- / NOT REPORTED`。来源读取失败会清空对应数据并提示错误，雷达源数据超过 48 小时会标记 `OLD`。刷新成功表示已收到新的采集结果。
+额度只显示普通 Codex 的每周窗口，不显示 5 小时卡片；账户未返回每周窗口时显示 `-- / NOT REPORTED`。Codex/Vibe 来源读取失败会清空对应数据并提示错误。雷达唤醒即显示最近一次完整榜单，标记 `CACHED DATA` 并保留真实时间；仅在全榜采集完成后替换前 6 名，不把部分结果当全榜。源数据超过 48 小时标记 `OLD`。
 
 项目中的账号凭据始终保留在 Mac 上。StickS3 只接收已经汇总的数字。
 
@@ -34,4 +34,4 @@ CodeX Master/
 
 - Codex：本机 Codex app-server 的只读额度接口。
 - Vibe Usage：本机现有 Vibe Usage 配置对应的统计接口。
-- Codex 雷达：[codexradar.com](https://codexradar.com/) 的“智力效率”结构化数据接口；不使用截图或 OCR。
+- Codex 雷达：[codexradar.com](https://codexradar.com/) 当前“雷达分 · 雷达Bench v1”的结构化数据；不混入旧版 IQ / 智力效率历史榜单，不使用截图或 OCR。

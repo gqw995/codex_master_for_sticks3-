@@ -37,6 +37,8 @@ constexpr gpio_num_t kSideButtonPin = GPIO_NUM_12;
 constexpr uint64_t kButtonWakeMask = (1ULL << kFrontButtonPin) | (1ULL << kSideButtonPin);
 constexpr char kPortalPassword[] = "codecmaster";
 constexpr uint8_t kMaxRadarModels = 12;
+constexpr uint8_t kDisplayedRadarModels = 6;
+constexpr uint8_t kRadarCacheVersion = 1;
 
 enum class ScreenPage : uint8_t { Codex = 0, Vibe = 1, Radar = 2 };
 enum class TimeRange : uint8_t { H24 = 0, D7 = 1, D30 = 2 };
@@ -67,6 +69,7 @@ struct UsageSnapshot {
   PeriodUsage periods[3];
   String radarUpdated;
   uint8_t radarCount = 0;
+  bool radarCached = false;
   RadarModel radarModels[kMaxRadarModels];
 };
 
@@ -271,7 +274,7 @@ bool allSourcesAvailable() {
   for (const PeriodUsage& period : usage.periods) {
     if (period.costCents < 0 || period.totalTokens < 0) return false;
   }
-  return usage.radarCount > 0 && !usage.radarUpdated.endsWith(" OLD");
+  return usage.radarCount > 0 && !usage.radarCached && !usage.radarUpdated.endsWith(" OLD");
 }
 
 uint8_t pageSourceIndex() {
@@ -281,6 +284,7 @@ uint8_t pageSourceIndex() {
 }
 
 bool pageRefreshPending() {
+  if (currentPage == ScreenPage::Radar && usage.radarCached && usage.radarCount > 0) return false;
   return refreshState == RefreshState::Pending &&
       (!refreshResponseStarted || (usage.pendingMask & (1 << pageSourceIndex())));
 }
@@ -288,6 +292,9 @@ bool pageRefreshPending() {
 String refreshFooterText() {
   if (pageRefreshPending()) return "REFRESHING...";
   if (!pageDataAvailable()) return "SOURCE ERROR";
+  if (currentPage == ScreenPage::Radar && usage.radarCached) {
+    return usage.radarUpdated.endsWith(" OLD") ? "CACHE OLD" : "CACHED DATA";
+  }
   if (currentPage == ScreenPage::Radar && usage.radarUpdated.endsWith(" OLD")) return "SOURCE OLD";
   if (refreshState == RefreshState::Failed && !refreshResponseStarted) return "REFRESH FAILED";
   if (refreshState != RefreshState::Idle) return "REFRESH OK";
@@ -298,6 +305,7 @@ String refreshFooterText() {
 uint32_t refreshFooterColor() {
   if (pageRefreshPending()) return kBlue;
   if (!pageDataAvailable()) return kRed;
+  if (currentPage == ScreenPage::Radar && usage.radarCached) return kAmber;
   if (currentPage == ScreenPage::Radar && usage.radarUpdated.endsWith(" OLD")) return kAmber;
   if (refreshState == RefreshState::Failed && !refreshResponseStarted) return kRed;
   if (refreshState != RefreshState::Idle) return kGreen;
@@ -388,14 +396,15 @@ void drawVibeScreen() {
 }
 
 uint8_t radarPageCount() {
-  return usage.radarCount == 0 ? 1 : (usage.radarCount + 2) / 3;
+  const int count = min(static_cast<int>(usage.radarCount), static_cast<int>(kDisplayedRadarModels));
+  return count == 0 ? 1 : (count + 2) / 3;
 }
 
 void drawRadarScreen() {
   const uint8_t pageCount = radarPageCount();
   if (currentRadarPage >= pageCount) currentRadarPage = 0;
 
-  drawHeader("CODEX RADAR", kAmber);
+  drawHeader("RADAR BENCH V1", kAmber);
 
   if (usage.radarCount == 0) {
     M5.Display.fillRoundRect(10, 56, M5.Display.width() - 20, 100, 9, kPanel);
@@ -409,12 +418,17 @@ void drawRadarScreen() {
     const int first = currentRadarPage * 3;
     for (int row = 0; row < 3; ++row) {
       const int index = first + row;
-      if (index >= usage.radarCount) break;
+      if (index >= usage.radarCount || index >= kDisplayedRadarModels) break;
       const int y = 34 + row * 52;
       M5.Display.fillRoundRect(8, y, M5.Display.width() - 16, 48, 8, kPanel);
       M5.Display.setTextDatum(top_center);
-      M5.Display.setTextFont(4);
-      M5.Display.setTextSize(0.82f, 1.0f);
+      M5.Display.setTextFont(2);
+      M5.Display.setTextSize(1.0f, 1.0f);
+      const int nameWidth = M5.Display.textWidth(usage.radarModels[index].name);
+      const int availableWidth = M5.Display.width() - 28;
+      if (nameWidth > availableWidth) {
+        M5.Display.setTextSize(static_cast<float>(availableWidth) / nameWidth, 1.0f);
+      }
       M5.Display.setTextColor(kWhite, kPanel);
       M5.Display.drawString(usage.radarModels[index].name, M5.Display.width() / 2, y + 4);
       M5.Display.setTextSize(1.0f, 1.0f);
@@ -572,6 +586,7 @@ void saveSnapshot() {
     prefs.putString((String("rname") + i).c_str(), usage.radarModels[i].name);
     prefs.putInt((String("rscore") + i).c_str(), usage.radarModels[i].scoreTenths);
   }
+  prefs.putUChar("radarVersion", kRadarCacheVersion);
   prefs.putString("preferred", preferredHost);
   prefs.end();
   snapshotDirty = false;
@@ -599,12 +614,17 @@ void loadState() {
     usage.periods[i].costCents = prefs.getInt((String("cost") + i).c_str(), -1);
     usage.periods[i].totalTokens = prefs.getLong64((String("tok") + i).c_str(), -1);
   }
-  usage.radarUpdated = prefs.getString("radarUpdate", "");
-  usage.radarCount = min(static_cast<int>(prefs.getUChar("radarCount", 0)),
-                         static_cast<int>(kMaxRadarModels));
-  for (int i = 0; i < kMaxRadarModels; ++i) {
-    usage.radarModels[i].name = prefs.getString((String("rname") + i).c_str(), "");
-    usage.radarModels[i].scoreTenths = prefs.getInt((String("rscore") + i).c_str(), -1);
+  if (prefs.getUChar("radarVersion", 0) == kRadarCacheVersion) {
+    usage.radarCached = true;
+    usage.radarUpdated = prefs.getString("radarUpdate", "");
+    usage.radarCount = min(static_cast<int>(prefs.getUChar("radarCount", 0)),
+                           static_cast<int>(kMaxRadarModels));
+    for (int i = 0; i < kMaxRadarModels; ++i) {
+      usage.radarModels[i].name = prefs.getString((String("rname") + i).c_str(), "");
+      usage.radarModels[i].scoreTenths = prefs.getInt((String("rscore") + i).c_str(), -1);
+    }
+  } else {
+    usage.sourceEpochs[4] = 0;
   }
   preferredHost = prefs.getString("preferred", "");
   prefs.end();
@@ -630,7 +650,8 @@ bool sameSnapshot(const UsageSnapshot& left, const UsageSnapshot& right) {
     if (left.periods[i].costCents != right.periods[i].costCents ||
         left.periods[i].totalTokens != right.periods[i].totalTokens) return false;
   }
-  if (left.radarUpdated != right.radarUpdated || left.radarCount != right.radarCount) return false;
+  if (left.radarUpdated != right.radarUpdated || left.radarCount != right.radarCount ||
+      left.radarCached != right.radarCached) return false;
   for (int i = 0; i < left.radarCount; ++i) {
     if (left.radarModels[i].name != right.radarModels[i].name ||
         left.radarModels[i].scoreTenths != right.radarModels[i].scoreTenths) return false;
@@ -643,11 +664,12 @@ bool parseUsageLine(const String& line, UsageSnapshot& parsed) {
   const bool isV3 = line.startsWith("USAGE3,");
   const bool isV4 = line.startsWith("USAGE4,");
   const bool isV5 = line.startsWith("USAGE5,");
-  if (!isV2 && !isV3 && !isV4 && !isV5) return false;
-  String fields[46];
+  const bool isV6 = line.startsWith("USAGE6,");
+  if (!isV2 && !isV3 && !isV4 && !isV5 && !isV6) return false;
+  String fields[47];
   int fieldIndex = 0;
   int start = 0;
-  for (int i = 0; i <= static_cast<int>(line.length()) && fieldIndex < 46; ++i) {
+  for (int i = 0; i <= static_cast<int>(line.length()) && fieldIndex < 47; ++i) {
     if (i == static_cast<int>(line.length()) || line[i] == ',') {
       fields[fieldIndex++] = line.substring(start, i);
       start = i + 1;
@@ -659,6 +681,7 @@ bool parseUsageLine(const String& line, UsageSnapshot& parsed) {
   if (isV3 && (fieldIndex < 14 || fields[0] != "USAGE3")) return false;
   if (isV4 && (fieldIndex < 16 || fields[0] != "USAGE4")) return false;
   if (isV5 && fieldIndex < 22) return false;
+  if (isV6 && fieldIndex < 23) return false;
   parsed.host = fields[1];
   parsed.fetchedEpoch = strtoll(fields[2].c_str(), nullptr, 10);
   parsed.quotaRemaining = constrain(fields[3].toInt(), -1L, 100L);
@@ -669,9 +692,9 @@ bool parseUsageLine(const String& line, UsageSnapshot& parsed) {
     parsed.periods[i].totalTokens = strtoll(fields[7 + i * 2].c_str(), nullptr, 10);
   }
 
-  if (isV3 || isV4 || isV5) {
+  if (isV3 || isV4 || isV5 || isV6) {
     const int radarCount = fields[13].toInt();
-    const int expectedFields = 14 + radarCount * 2 + (isV5 ? 8 : isV4 ? 2 : 0);
+    const int expectedFields = 14 + radarCount * 2 + (isV6 ? 9 : isV5 ? 8 : isV4 ? 2 : 0);
     if (radarCount < 0 || radarCount > kMaxRadarModels || fieldIndex != expectedFields) return false;
     parsed.radarUpdated = fields[12];
     parsed.radarCount = radarCount;
@@ -679,17 +702,22 @@ bool parseUsageLine(const String& line, UsageSnapshot& parsed) {
       parsed.radarModels[i].name = fields[14 + i * 2];
       parsed.radarModels[i].scoreTenths = static_cast<int16_t>(fields[15 + i * 2].toInt());
     }
-    if (isV4 || isV5) {
+    if (isV4 || isV5 || isV6) {
       const int quota5hIndex = 14 + radarCount * 2;
       parsed.quota5hRemaining = constrain(fields[quota5hIndex].toInt(), -1L, 100L);
       parsed.quota5hResetEpoch = strtoll(fields[quota5hIndex + 1].c_str(), nullptr, 10);
-      if (isV5) {
+      if (isV5 || isV6) {
         const int pending = fields[quota5hIndex + 2].toInt();
         if (pending < 0 || pending > 31) return false;
         parsed.pendingMask = pending;
         parsed.incremental = true;
         for (int i = 0; i < 5; ++i) {
           parsed.sourceEpochs[i] = strtoll(fields[quota5hIndex + 3 + i].c_str(), nullptr, 10);
+        }
+        if (isV6) {
+          const String& cached = fields[quota5hIndex + 8];
+          if (cached != "0" && cached != "1") return false;
+          parsed.radarCached = cached == "1";
         }
       }
     } else {
@@ -705,8 +733,18 @@ bool parseUsageLine(const String& line, UsageSnapshot& parsed) {
     parsed.quota5hRemaining = usage.quota5hRemaining;
     parsed.quota5hResetEpoch = usage.quota5hResetEpoch;
   }
-  if (!isV5) {
+  if (!isV5 && !isV6) {
     for (int i = 0; i < 5; ++i) parsed.sourceEpochs[i] = parsed.fetchedEpoch;
+  }
+  if (!isV6) {
+    // Older bridges contain IQ scores, not Bench v1 scores. They may update
+    // Codex/Vibe, but must not relabel the legacy radar as the new benchmark.
+    parsed.radarUpdated = usage.radarUpdated;
+    parsed.radarCount = usage.radarCount;
+    parsed.radarCached = true;
+    parsed.sourceEpochs[4] = usage.sourceEpochs[4];
+    parsed.pendingMask &= ~(1 << 4);
+    for (int i = 0; i < usage.radarCount; ++i) parsed.radarModels[i] = usage.radarModels[i];
   }
   return parsed.fetchedEpoch > 0;
 }
@@ -766,8 +804,8 @@ bool applyUsageLine(const String& line, DataSource incomingSource) {
     // Persist once at sleep, keeping flash writes out of interactive refresh.
     drawScreen();
   }
-  Serial.printf("STICKS3_DATA,PENDING=%u,PAGE=%d,READY=%d\n", usage.pendingMask,
-                static_cast<int>(currentPage), pageDataAvailable());
+  Serial.printf("STICKS3_DATA,PENDING=%u,PAGE=%d,READY=%d,RADAR_CACHE=%d\n", usage.pendingMask,
+                static_cast<int>(currentPage), pageDataAvailable(), usage.radarCached);
   if (incomingSource == DataSource::Usb) Serial.println("USAGE_ACK");
   return true;
 }
@@ -1009,7 +1047,7 @@ void handleButtons() {
 }  // namespace
 
 void setup() {
-  // A full USAGE5 payload with 12 radar models is larger than the ESP32-S3
+  // A full usage payload with 12 radar models is larger than the ESP32-S3
   // HW CDC default 256-byte RX queue. Allocate this before M5.begin() calls
   // Serial.begin(), otherwise the tail (including the newline) can be lost.
   Serial.setRxBufferSize(1024);
@@ -1039,7 +1077,7 @@ void setup() {
   if (savedSsid.isEmpty()) startPortal();
   else connectWifi();
   Serial.println("STICKS3_READY");
-  Serial.printf("STICKS3_STATUS,FW=responsive-v5,BOARD=%d,BAT=%d,WAKE=%d,CHG=%d,RESET=%d,PAGE=%d,PWR_NAV=%d\n",
+  Serial.printf("STICKS3_STATUS,FW=radar-bench-v1,BOARD=%d,BAT=%d,WAKE=%d,CHG=%d,RESET=%d,PAGE=%d,PWR_NAV=%d\n",
                 static_cast<int>(M5.getBoard()), cachedBatteryLevel, wokeByButton,
                 static_cast<int>(M5.Power.isCharging()), static_cast<int>(esp_reset_reason()),
                 static_cast<int>(currentPage), powerKeyNavigation);

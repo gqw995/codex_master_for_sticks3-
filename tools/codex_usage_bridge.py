@@ -12,8 +12,8 @@ import argparse
 import errno
 import glob
 import gzip
-import html
 import json
+import math
 import os
 import queue
 import re
@@ -23,10 +23,11 @@ import socket
 import subprocess
 import threading
 import time
+import tempfile
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -39,11 +40,14 @@ CODEX_BIN_CANDIDATES = tuple(
     for relative in ("codex-cli/CodexCLI.app/Contents/MacOS/codex", "codex-cli/bin/codex", "codex")
 )
 DEFAULT_VIBE_API = "https://vibecafe.ai"
-CODEX_RADAR_URL = "https://codexradar.com/"
-CODEX_RADAR_LIVE_URL = "https://codexradar.com/api/intelligence-efficiency-metrics"
-CODEX_RADAR_DATA_URL = "https://codexradar.com/data/intelligence-efficiency.json"
+RADAR_BENCH_BINDING_URL = "https://codexradar.com/data/radar-bench-binding.json"
+RADAR_BENCH_SCORE_URL = "https://codexradar.com/api/radar-bench-score"
+RADAR_BENCH_BENCHMARK = "radar-bench-final64-20261004"
+RADAR_BENCH_SCORE_VERSION = "radar-bench-v2-150"
+RADAR_BENCH_SUMMARY_SCHEMA = "radar-bench-public-summary-v6-150-details"
+RADAR_BENCH_CACHE_SCHEMA = "sticks3-radar-bench-cache-v1"
 WIFI_BROADCAST_PORT = 47322
-PROTOCOL_PREFIX = "USAGE5"
+PROTOCOL_PREFIX = "USAGE6"
 
 
 def safe_host_name(value: str) -> str:
@@ -66,6 +70,8 @@ class RadarModel:
 class RadarUsage:
     updated: str = ""
     models: tuple[RadarModel, ...] = ()
+    fetched_epoch: int = 0
+    cached: bool = False
 
 
 @dataclass(frozen=True)
@@ -114,6 +120,7 @@ class UsageSnapshot:
             self.pending_mask, self.codex_fetched_epoch, self.vibe24_fetched_epoch,
             self.vibe7_fetched_epoch, self.vibe30_fetched_epoch, self.radar_fetched_epoch,
         ))
+        fields.append("1" if self.radar.cached else "0")
         return ",".join(fields)
 
 
@@ -461,9 +468,273 @@ class CodexAppServer:
                 self._process.kill()
 
 
+class RadarBenchReader:
+    """Keep only complete, validated public Bench rankings as display cache."""
+
+    def __init__(self, cache_path: Path | None = None) -> None:
+        self.cache_path = cache_path or (
+            Path.home() / "Library/Application Support/StickS3 Usage Bridge/radar-bench-cache.json"
+        )
+        self.binding: dict[str, Any] | None = None
+        self._entries: dict[tuple[str, str], dict[str, Any]] = {}
+        self._cycle_started_epoch = 0
+        self._cache: dict[str, Any] | None = None
+        self.completion_epoch = 0
+        try:
+            with self.cache_path.open("r", encoding="utf-8") as handle:
+                record = json.load(handle)
+            if not isinstance(record, dict) or record.get("schema") != RADAR_BENCH_CACHE_SCHEMA:
+                raise ValueError("unexpected cache schema")
+            binding = self._validate_binding(record["binding"])
+            entries = self._validate_entries(record["entries"], binding)
+            completion = record["completion_epoch"]
+            if (type(completion) is not int or completion > int(time.time()) + 60
+                    or completion < max(e["read_epoch"] for e in entries)):
+                raise ValueError("invalid completion time")
+            self._cache = {"binding": binding, "entries": entries}
+            self.completion_epoch = completion
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print(f"Radar Bench cache ignored: {error}", flush=True)
+
+    @staticmethod
+    def _validate_binding(value: dict[str, Any]) -> dict[str, Any]:
+        if (not isinstance(value, dict)
+                or value.get("enabled") is not True or value.get("production_read_verified") is not True
+                or value.get("benchmark") != RADAR_BENCH_BENCHMARK
+                or value.get("score_version") != RADAR_BENCH_SCORE_VERSION
+                or value.get("score_max") != 150 or value.get("total_tasks") != 64
+                or not isinstance(value.get("catalog_version"), str) or not value["catalog_version"]
+                or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("task_set_sha256", "")))):
+            raise ValueError("invalid Radar Bench binding")
+        selections = value.get("model_efforts")
+        if not isinstance(selections, list) or not selections:
+            raise ValueError("Radar Bench selections missing")
+        keys: set[tuple[str, str]] = set()
+        for selection in selections:
+            if (not isinstance(selection, dict) or set(selection) != {"model", "effort"}
+                    or not all(isinstance(selection[k], str) and selection[k] for k in ("model", "effort"))):
+                raise ValueError("invalid Radar Bench selection")
+            key = (selection["model"], selection["effort"])
+            if key in keys:
+                raise ValueError("duplicate Radar Bench selection")
+            keys.add(key)
+        return {key: value[key] for key in (
+            "enabled", "production_read_verified", "benchmark", "catalog_version", "task_set_sha256",
+            "score_version", "score_max", "total_tasks", "model_efforts",
+        )}
+
+    @staticmethod
+    def _grade_epoch(value: str) -> float:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("Radar Bench grade time needs a timezone")
+        return parsed.timestamp()
+
+    @classmethod
+    def _validate_summary(
+        cls, value: dict[str, Any], binding: dict[str, Any], selection: tuple[str, str],
+    ) -> dict[str, Any]:
+        if (not isinstance(value, dict) or value.get("schema") != RADAR_BENCH_SUMMARY_SCHEMA
+                or any(value.get(k) != binding[k] for k in (
+                    "benchmark", "catalog_version", "task_set_sha256", "score_version", "score_max"))
+                or (value.get("model"), value.get("effort")) != selection):
+            raise ValueError("Radar Bench summary identity mismatch")
+        coverage, required, score = value.get("coverage"), value.get("required_tasks"), value.get("score")
+        if (type(coverage) is not int or type(required) is not int
+                or required != binding["total_tasks"] or not 0 <= coverage <= required):
+            raise ValueError("invalid Radar Bench coverage")
+        if score is None:
+            if coverage != 0:
+                raise ValueError("covered Radar Bench result has no score")
+        elif (isinstance(score, bool) or not isinstance(score, (int, float))
+              or not math.isfinite(score) or not 0 <= score <= 150 or coverage == 0):
+            raise ValueError("invalid Radar Bench score")
+        status = "missing_current_result" if coverage == 0 else "complete" if coverage == required else "provisional"
+        if value.get("score_status") != status:
+            raise ValueError("Radar Bench score status disagrees with coverage")
+        detail = value.get("detail_metrics") or {}
+        if not isinstance(detail, dict):
+            raise ValueError("invalid Radar Bench grade metadata")
+        latest = detail.get("latest_graded_at")
+        if latest is not None:
+            if not isinstance(latest, str):
+                raise ValueError("invalid Radar Bench grade time")
+            cls._grade_epoch(latest)
+        if score is not None and latest is None:
+            raise ValueError("Radar Bench score has no actual grade time")
+        return {**{key: value[key] for key in (
+            "schema", "benchmark", "catalog_version", "task_set_sha256", "score_version", "score_max",
+            "model", "effort", "score", "coverage", "required_tasks", "score_status",
+        )}, "detail_metrics": {"latest_graded_at": latest}}
+
+    @classmethod
+    def _validate_entries(cls, values: list[dict[str, Any]], binding: dict[str, Any]) -> list[dict[str, Any]]:
+        if not isinstance(values, list):
+            raise ValueError("invalid Radar Bench cache entries")
+        expected = {(s["model"], s["effort"]) for s in binding["model_efforts"]}
+        entries: dict[tuple[str, str], dict[str, Any]] = {}
+        for entry in values:
+            if not isinstance(entry, dict) or not isinstance(entry.get("summary"), dict):
+                raise ValueError("invalid Radar Bench cache entry")
+            summary = entry["summary"]
+            key = (summary["model"], summary["effort"])
+            if key not in expected or key in entries or type(entry["read_epoch"]) is not int or entry["read_epoch"] <= 0:
+                raise ValueError("invalid Radar Bench cache entry")
+            entries[key] = {"read_epoch": entry["read_epoch"], "summary": cls._validate_summary(summary, binding, key)}
+        if set(entries) != expected:
+            raise ValueError("incomplete Radar Bench cache")
+        return list(entries.values())
+
+    @staticmethod
+    def _usage(entries: list[dict[str, Any]], cached: bool) -> RadarUsage:
+        ranked = [e["summary"] for e in entries if e["summary"]["score"] is not None]
+        ranked.sort(key=lambda s: (-s["score"], s["model"], s["effort"]))
+        top = ranked[:6]
+        models = tuple(RadarModel(
+            f"{s['model'].removeprefix('gpt-').replace('-', ' ').title()} {s['effort']}",
+            int(math.floor(s["score"] * 10 + 0.5)),
+        ) for s in top)
+        grade_times = [RadarBenchReader._grade_epoch(s["detail_metrics"]["latest_graded_at"]) for s in top]
+        updated = ""
+        if grade_times:
+            latest = max(grade_times)
+            updated = datetime.fromtimestamp(latest, timezone(timedelta(hours=8))).strftime("%m/%d %H:%M")
+            if time.time() - latest > 48 * 3600:
+                updated += " OLD"
+        return RadarUsage(updated, models, min(e["read_epoch"] for e in entries), cached)
+
+    def cached_usage(self) -> RadarUsage:
+        return self._usage(self._cache["entries"], True) if self._cache else RadarUsage()
+
+    def _read_json(self, url: str, cancel_event: threading.Event, deadline: float) -> dict[str, Any]:
+        def remaining() -> float:
+            if cancel_event.is_set():
+                raise RuntimeError("Radar Bench refresh cancelled")
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise TimeoutError("Radar Bench refresh budget exhausted")
+            return budget
+
+        request = urllib.request.Request(url, headers={
+            "User-Agent": "StickS3-Usage-Bridge/6.0", "Accept-Encoding": "gzip",
+            "X-Radar-Bench-Selection": "user-selected-v1",
+        })
+        with urllib.request.urlopen(request, timeout=min(3.0, remaining())) as response:
+            chunks: list[bytes] = []
+            while True:
+                remaining()
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            remaining()
+            body = b"".join(chunks)
+            if response.headers.get("Content-Encoding", "").lower() == "gzip":
+                body = gzip.decompress(body)
+        return json.loads(body)
+
+    def _save_cache(self, binding: dict[str, Any], entries: list[dict[str, Any]], completion: int) -> None:
+        record = {"schema": RADAR_BENCH_CACHE_SCHEMA, "binding": binding, "entries": entries,
+                  "completion_epoch": completion}
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.cache_path.parent,
+                prefix=self.cache_path.name + ".", delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+                json.dump(record, handle, separators=(",", ":"))
+            os.replace(temp_path, self.cache_path)
+        finally:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink()
+
+    def refresh(self, cancel_event: threading.Event | None = None, budget_seconds: float = 8) -> RadarUsage:
+        cancelled = cancel_event if cancel_event is not None else threading.Event()
+        if cancelled.is_set():
+            raise RuntimeError("Radar Bench refresh cancelled")
+        if self._cache and time.time() - self.completion_epoch < 300:
+            return self.cached_usage()
+        deadline = time.monotonic() + budget_seconds
+        try:
+            if not self.binding or time.time() - self._cycle_started_epoch >= 3600:
+                binding = self._validate_binding(self._read_json(RADAR_BENCH_BINDING_URL, cancelled, deadline))
+                if cancelled.is_set():
+                    raise RuntimeError("Radar Bench refresh cancelled")
+                self.binding, self._entries = binding, {}
+                self._cycle_started_epoch = int(time.time())
+                if self._cache and self._cache["binding"] != binding:
+                    self._cache = None
+                    self.completion_epoch = 0
+            binding = self.binding
+            missing = iter((s["model"], s["effort"]) for s in binding["model_efforts"]
+                           if (s["model"], s["effort"]) not in self._entries)
+
+            def read_selection(key: tuple[str, str]) -> dict[str, Any]:
+                url = RADAR_BENCH_SCORE_URL + "?" + urllib.parse.urlencode(
+                    {"model": key[0], "effort": key[1], "view": "summary"},
+                )
+                summary = self._validate_summary(self._read_json(url, cancelled, deadline), binding, key)
+                return {"summary": summary, "read_epoch": int(time.time())}
+
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                running: dict[Any, tuple[str, str]] = {}
+
+                def enqueue() -> None:
+                    if cancelled.is_set() or time.monotonic() >= deadline:
+                        return
+                    key = next(missing, None)
+                    if key is not None:
+                        running[pool.submit(read_selection, key)] = key
+
+                for _ in range(3):
+                    enqueue()
+                while running and not cancelled.is_set():
+                    budget = deadline - time.monotonic()
+                    if budget <= 0:
+                        break
+                    completed, _ = wait(running, timeout=budget, return_when=FIRST_COMPLETED)
+                    if not completed:
+                        break
+                    for future in completed:
+                        key = running.pop(future)
+                        if cancelled.is_set() or time.monotonic() >= deadline:
+                            break
+                        try:
+                            self._entries[key] = future.result()
+                        except Exception as error:
+                            print(f"Radar Bench {key[0]} {key[1]} read failed: {error}", flush=True)
+                        enqueue()
+                for future in running:
+                    future.cancel()
+            if cancelled.is_set():
+                raise RuntimeError("Radar Bench refresh cancelled")
+            if len(self._entries) == len(binding["model_efforts"]):
+                entries = self._validate_entries(list(self._entries.values()), binding)
+                completion = int(time.time())
+                try:
+                    self._save_cache(binding, entries, completion)
+                except OSError as error:
+                    print(f"Radar Bench cache save failed: {error}", flush=True)
+                self._cache = {"binding": binding, "entries": entries}
+                self.completion_epoch = completion
+                self.binding, self._entries, self._cycle_started_epoch = None, {}, 0
+                return self._usage(entries, False)
+        except Exception:
+            if cancelled.is_set() or not self._cache:
+                raise
+        if self._cache:
+            return self.cached_usage()
+        raise RuntimeError(f"Radar Bench full ranking incomplete ({len(self._entries)} selections read)")
+
+
 class MetricsCollector:
     def __init__(self) -> None:
         self.codex: CodexAppServer | None = None
+        self.radar_reader = RadarBenchReader()
 
     @staticmethod
     def _find_codex() -> str:
@@ -515,125 +786,11 @@ class MetricsCollector:
             )
         return PeriodUsage(cost_cents=round(total_cost * 100), total_tokens=total_tokens)
 
-    @staticmethod
-    def _read_codex_radar(cancel_event: threading.Event | None = None) -> RadarUsage:
-        deadline = time.monotonic() + 8.0
+    def _read_codex_radar(self, cancel_event: threading.Event | None = None) -> RadarUsage:
+        return self.radar_reader.refresh(cancel_event)
 
-        def read_url(url: str) -> bytes:
-            def check_deadline() -> float:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise RuntimeError("Radar refresh cancelled")
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("Radar refresh exceeded 8 seconds")
-                return remaining
-
-            remaining = check_deadline()
-            request = urllib.request.Request(
-                url,
-                headers={"User-Agent": "StickS3-Usage-Bridge/3.0", "Accept-Encoding": "gzip"},
-                method="GET",
-            )
-            with urllib.request.urlopen(request, timeout=min(3.0, remaining)) as response:
-                chunks: list[bytes] = []
-                while True:
-                    check_deadline()
-                    chunk = response.read(64 * 1024)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                check_deadline()
-                compressed = response.headers.get("Content-Encoding", "").lower() == "gzip"
-            body = b"".join(chunks)
-            return gzip.decompress(body) if compressed else body
-
-        data_error: Exception | None = None
-        for url in (CODEX_RADAR_LIVE_URL, CODEX_RADAR_DATA_URL):
-            try:
-                data = json.loads(read_url(url))
-                if data.get("benchmark_id") and data["benchmark_id"] != "deep-swe":
-                    raise RuntimeError("Unexpected Codex Radar benchmark cohort")
-
-                source = data.get("source_updated_at") or data.get("generated_at")
-                source_values = source.values() if isinstance(source, dict) else (source,)
-                source_dates: list[datetime] = []
-                for value in source_values:
-                    try:
-                        source_date = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-                    except ValueError:
-                        continue
-                    if source_date.tzinfo is None:
-                        source_date = source_date.replace(tzinfo=timezone.utc)
-                    source_dates.append(source_date)
-                if not source_dates:
-                    raise RuntimeError("Codex Radar source update time was not found")
-                updated_at = max(source_dates).astimezone(timezone(timedelta(hours=8)))
-
-                model_names = {
-                    "gpt-5.6-sol": "Sol",
-                    "gpt-5.6-terra": "Terra",
-                    "gpt-5.6-luna": "Luna",
-                    "gpt-5.5": "5.5",
-                }
-                models: list[RadarModel] = []
-                for point in data.get("points") or []:
-                    model_id = str(point.get("model") or "").strip()
-                    effort = str(point.get("effort") or "").strip()
-                    iq = point.get("iq")
-                    if not model_id or not effort or iq is None:
-                        continue
-                    model_name = model_names.get(model_id)
-                    if not model_name:
-                        model_name = model_id.removeprefix("gpt-").replace("-", " ").title()
-                    models.append(
-                        RadarModel(name=f"{model_name} {effort}", score_tenths=round(float(iq) * 10))
-                    )
-                if not models:
-                    raise RuntimeError("Codex Radar model scores were not found")
-                models.sort(key=lambda model: (-model.score_tenths, model.name.lower()))
-                updated = updated_at.strftime("%m/%d %H:%M")
-                if time.time() - updated_at.timestamp() > 48 * 3600:
-                    updated += " OLD"
-                return RadarUsage(updated=updated, models=tuple(models[:12]))
-            except Exception as error:
-                data_error = error
-
-        page = read_url(CODEX_RADAR_URL).decode("utf-8", errors="replace")
-
-        section_match = re.search(
-            r'<section\s+class="model-iq model-iq-green".*?</section>',
-            page,
-            flags=re.DOTALL,
-        )
-        if not section_match:
-            raise RuntimeError(
-                f"Codex Radar data endpoint failed ({data_error}); legacy score section was not found"
-            ) from data_error
-        section = section_match.group(0)
-        updated_match = re.search(
-            r'<h2>\s*降智雷达\s*<span>(\d{1,2})月(\d{1,2})日(\d{1,2}):(\d{2})更新</span>',
-            section,
-        )
-        card_pattern = re.compile(
-            r'class="model-iq-score-chip[^\"]*"[^>]*>\s*'
-            r'<span>([^<]+)</span>\s*'
-            r'<div\s+class="model-iq-score-metrics"><strong>([0-9]+(?:\.[0-9]+)?)</strong>',
-            flags=re.DOTALL,
-        )
-        if not updated_match:
-            raise RuntimeError("Codex Radar update time was not found")
-        month, day, hour, minute = (int(value) for value in updated_match.groups())
-        updated = f"{month:02d}/{day:02d} {hour:02d}:{minute:02d}"
-        models: list[RadarModel] = []
-        for raw_name, raw_score in card_pattern.findall(section):
-            name = " ".join(html.unescape(raw_name).split())
-            if name.startswith("GPT-"):
-                name = name.removeprefix("GPT-")
-            models.append(RadarModel(name=name, score_tenths=round(float(raw_score) * 10)))
-        if not models:
-            raise RuntimeError("Codex Radar model scores were not found")
-        models.sort(key=lambda model: (-model.score_tenths, model.name.lower()))
-        return RadarUsage(updated=updated, models=tuple(models[:12]))
+    def _cached_radar(self) -> RadarUsage:
+        return self.radar_reader.cached_usage()
 
     def collect(
         self,
@@ -649,7 +806,12 @@ class MetricsCollector:
             pass
 
         cancelled = cancel_event if cancel_event is not None else threading.Event()
-        snapshot = UsageSnapshot(host=host, fetched_epoch=int(time.time()), pending_mask=31)
+        cached_radar = self._cached_radar()
+        snapshot = UsageSnapshot(
+            host=host, fetched_epoch=int(time.time()), radar=cached_radar,
+            radar_fetched_epoch=cached_radar.fetched_epoch,
+            pending_mask=15 if cached_radar.fetched_epoch > 0 else 31,
+        )
 
         def publish() -> None:
             if on_progress is not None and not cancelled.is_set():
@@ -711,7 +873,7 @@ class MetricsCollector:
                             codex_fetched_epoch=completed_at,
                         )
                     elif bit == 4:
-                        fields.update(radar=result, radar_fetched_epoch=completed_at)
+                        fields.update(radar=result, radar_fetched_epoch=result.fetched_epoch)
                     else:
                         period_name, epoch_name = {
                             1: ("usage_24h", "vibe24_fetched_epoch"),

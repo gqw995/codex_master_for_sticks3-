@@ -29,170 +29,270 @@ class FakeResponse:
 
 
 class CodexRadarTests(unittest.TestCase):
-    def test_reads_gzip_compressed_radar_response(self) -> None:
-        data = {
-            "source_updated_at": "2026-10-22T02:00:00Z",
-            "points": [{"model": "gpt-6-sol", "effort": "high", "iq": 98.6}],
+    def setUp(self) -> None:
+        self.cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.cache_dir.cleanup)
+        self.cache_path = Path(self.cache_dir.name) / "radar-cache.json"
+        self.reader = codex_usage_bridge.RadarBenchReader(self.cache_path)
+        options = [
+            {"model": model, "effort": effort}
+            for model in (
+                "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol",
+                "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-luna",
+            )
+            for effort in (
+                ("low", "medium", "high", "xhigh", "max")
+                if "luna" in model else ("low", "medium", "high", "xhigh", "max", "ultra")
+            )
+        ]
+        self.binding = {
+            "enabled": True,
+            "interface_confirmed": True,
+            "production_read_verified": True,
+            "transport_origin": "https://api.codexradar.com",
+            "endpoint_path": "/api/v1/radar-bench-score",
+            "benchmark": "radar-bench-final64-20261004",
+            "score_version": "radar-bench-v2-150",
+            "score_max": 150,
+            "catalog_version": "test-catalog-v1",
+            "task_set_sha256": "a" * 64,
+            "total_tasks": 64,
+            "total_cells": 320,
+            "source_counts": {"deepswe": 15, "pompeii": 16, "tb4": 14, "science": 19},
+            "model_efforts": options,
         }
-        body = gzip.compress(json.dumps(data).encode("utf-8"))
-        response = FakeResponse(body, {"Content-Encoding": "gzip"})
-        with mock.patch.object(codex_usage_bridge.urllib.request, "urlopen", return_value=response) as opened:
-            radar = codex_usage_bridge.MetricsCollector._read_codex_radar()
+        self.summaries = {
+            (option["model"], option["effort"]): self.summary(option, float(index))
+            for index, option in enumerate(options)
+        }
 
-        self.assertEqual(radar.models[0].score_tenths, 986)
-        self.assertEqual(opened.call_args.args[0].get_header("Accept-encoding"), "gzip")
+    def summary(self, option: dict[str, str], score: float | None) -> dict[str, object]:
+        return {
+            "schema": "radar-bench-public-summary-v6-150-details",
+            "benchmark": self.binding["benchmark"],
+            "score_version": "radar-bench-v2-150",
+            "score_max": 150,
+            "catalog_version": self.binding["catalog_version"],
+            "task_set_sha256": self.binding["task_set_sha256"],
+            **option,
+            "score": score,
+            "coverage": 64 if score is not None else 0,
+            "required_tasks": 64,
+            "score_status": "complete" if score is not None else "missing_current_result",
+            "graded_runs_count": 64 if score is not None else 0,
+            "source_counts": self.binding["source_counts"],
+            "detail_metrics": {
+                "latest_graded_at": "2026-10-21T02:39:21Z" if score is not None else None,
+            },
+        }
 
-    def test_cancellation_stops_http_fallbacks(self) -> None:
-        cancelled = threading.Event()
+    def respond(self, url: str, cancel_event: threading.Event, deadline: float) -> dict[str, object]:
+        if "radar-bench-binding.json" in url:
+            return json.loads(json.dumps(self.binding))
+        query = codex_usage_bridge.urllib.parse.parse_qs(
+            codex_usage_bridge.urllib.parse.urlparse(url).query
+        )
+        key = (query["model"][0], query["effort"][0])
+        return json.loads(json.dumps(self.summaries[key]))
 
-        def urlopen(request: object, timeout: float) -> FakeResponse:
-            cancelled.set()
-            raise OSError("live endpoint failed")
+    def refresh(self, now: int = 200) -> codex_usage_bridge.RadarUsage:
+        with (
+            mock.patch.object(self.reader, "_read_json", side_effect=self.respond),
+            mock.patch.object(codex_usage_bridge.time, "time", return_value=now),
+        ):
+            return self.reader.refresh()
 
-        with mock.patch.object(codex_usage_bridge.urllib.request, "urlopen", side_effect=urlopen) as opened:
-            with self.assertRaisesRegex(RuntimeError, "cancelled"):
-                codex_usage_bridge.MetricsCollector._read_codex_radar(cancelled)
+    def test_full_ranking_sorts_raw_scores_before_rounding_and_takes_six(self) -> None:
+        options = self.binding["model_efforts"]
+        # These two scores round to the same tenth, but the later option wins.
+        self.summaries[(options[0]["model"], options[0]["effort"])] = self.summary(options[0], 140.01)
+        self.summaries[(options[1]["model"], options[1]["effort"])] = self.summary(options[1], 140.04)
+        radar = self.refresh()
 
-        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(len(json.loads(self.cache_path.read_text())["entries"]), 34)
+        self.assertEqual(len(radar.models), 6)
+        self.assertEqual(radar.models[0], codex_usage_bridge.RadarModel("6.1 Sol medium", 1400))
+        self.assertEqual(radar.models[1], codex_usage_bridge.RadarModel("6.1 Sol low", 1400))
+        self.assertEqual([model.score_tenths for model in radar.models[2:]], [330, 320, 310, 300])
+        self.assertTrue(self.cache_path.exists())
+        self.assertFalse(radar.cached)
 
-    def read_radar(
-        self,
-        page: str,
-        data: dict[str, object] | None = None,
-        live_data: dict[str, object] | None = None,
-        now: str = "2026-07-22T06:00:00+00:00",
-    ) -> codex_usage_bridge.RadarUsage:
-        self.requested_urls: list[str] = []
+    def test_public_150_point_score_is_not_scaled_again(self) -> None:
+        option = self.binding["model_efforts"][0]
+        self.summaries[(option["model"], option["effort"])] = self.summary(option, 102.63728753664665)
 
-        def urlopen(request: object, timeout: int) -> FakeResponse:
-            url = getattr(request, "full_url", "")
-            self.requested_urls.append(url)
-            if url == codex_usage_bridge.CODEX_RADAR_LIVE_URL:
-                if live_data is None:
-                    raise OSError("live endpoint unavailable")
-                return FakeResponse(json.dumps(live_data))
-            if url == codex_usage_bridge.CODEX_RADAR_DATA_URL:
-                if data is None:
-                    raise OSError("current data endpoint unavailable")
-                return FakeResponse(json.dumps(data))
-            return FakeResponse(page)
+        self.assertEqual(self.refresh().models[0].score_tenths, 1026)
+
+    def test_null_score_is_valid_ungraded_data_and_still_completes_full_cache(self) -> None:
+        option = self.binding["model_efforts"][0]
+        self.summaries[(option["model"], option["effort"])] = self.summary(option, None)
+        radar = self.refresh()
+
+        self.assertEqual(len(json.loads(self.cache_path.read_text())["entries"]), 34)
+        self.assertEqual(len(radar.models), 6)
+        self.assertNotIn("6.1 Sol low", [model.name for model in radar.models])
+        self.assertTrue(self.cache_path.exists())
+
+    def test_identity_mismatch_or_missing_summary_does_not_replace_good_cache(self) -> None:
+        self.refresh(200)
+        saved = self.cache_path.read_bytes()
+        option = self.binding["model_efforts"][0]
+        key = (option["model"], option["effort"])
+        changes = (
+            {"schema": "old-schema"},
+            {"score_version": "old-score-version"},
+            {"score_max": 100},
+            {"benchmark": "different-benchmark"},
+            {"catalog_version": "different-catalog"},
+            {"task_set_sha256": "b" * 64},
+            {"model": "gpt-unbound"},
+            {"effort": "unbound"},
+            {"score": float("nan")},
+            {"score": 151},
+            {"required_tasks": 63},
+            {"score": None, "coverage": 1},
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                self.reader = codex_usage_bridge.RadarBenchReader(self.cache_path)
+                self.summaries[key] = self.summary(option, 50)
+                self.summaries[key].update(change)
+                result = self.refresh(600)
+                self.assertEqual(self.cache_path.read_bytes(), saved)
+                self.assertTrue(result.cached)
+                self.assertEqual(result.fetched_epoch, 200)
+
+        self.reader = codex_usage_bridge.RadarBenchReader(self.cache_path)
+        self.summaries[key] = self.summary(option, 50)
+
+        def missing(url: str, cancel_event: threading.Event, deadline: float) -> dict[str, object]:
+            if "radar-bench-binding.json" not in url:
+                query = codex_usage_bridge.urllib.parse.parse_qs(codex_usage_bridge.urllib.parse.urlparse(url).query)
+                if (query["model"][0], query["effort"][0]) == key:
+                    raise OSError("selection unavailable")
+            return self.respond(url, cancel_event, deadline)
 
         with (
-            mock.patch.object(
-                codex_usage_bridge.urllib.request,
-                "urlopen",
-                side_effect=urlopen,
-            ),
-            mock.patch.object(
-                codex_usage_bridge.time, "time",
-                return_value=codex_usage_bridge.datetime.fromisoformat(now).timestamp(),
-            ),
+            mock.patch.object(self.reader, "_read_json", side_effect=missing),
+            mock.patch.object(codex_usage_bridge.time, "time", return_value=700),
         ):
-            return codex_usage_bridge.MetricsCollector._read_codex_radar()
+            result = self.reader.refresh()
+        self.assertEqual(self.cache_path.read_bytes(), saved)
+        self.assertTrue(result.cached)
+        self.assertEqual(result.fetched_epoch, 200)
 
-    def test_reads_current_intelligence_efficiency_data(self) -> None:
-        data = {
-            "source_updated_at": "2026-07-22T05:29:00+00:00",
-            "points": [
-                {"model": "gpt-5.6-sol", "effort": "ultra", "iq": 101.8},
-                {"model": "gpt-5.6-terra", "effort": "max", "iq": 103.1},
-            ],
-        }
+    def test_cache_reload_and_failed_refresh_keep_original_time(self) -> None:
+        live = self.refresh(200)
+        self.reader = codex_usage_bridge.RadarBenchReader(self.cache_path)
+        with mock.patch.object(codex_usage_bridge.time, "time", return_value=900):
+            cached = self.reader.cached_usage()
+        self.assertTrue(cached.cached)
+        self.assertEqual(cached.fetched_epoch, live.fetched_epoch)
+        self.assertEqual(cached.updated, live.updated)
+        self.assertEqual(cached.models, live.models)
 
-        radar = self.read_radar("", data)
+        with mock.patch.object(self.reader, "_read_json", side_effect=OSError("offline")):
+            cached = self.reader.refresh()
+        self.assertTrue(cached.cached)
+        self.assertEqual(cached.fetched_epoch, 200)
 
-        self.assertEqual(radar.updated, "07/22 13:29")
-        self.assertEqual(
-            radar.models,
-            (
-                codex_usage_bridge.RadarModel(name="Terra max", score_tenths=1031),
-                codex_usage_bridge.RadarModel(name="Sol ultra", score_tenths=1018),
-            ),
-        )
+    def test_cancelled_reader_starts_no_requests_and_writes_no_cache(self) -> None:
+        cancelled = threading.Event()
+        cancelled.set()
+        with mock.patch.object(self.reader, "_read_json") as read:
+            with self.assertRaisesRegex(RuntimeError, "cancelled"):
+                self.reader.refresh(cancelled)
+        read.assert_not_called()
+        self.assertFalse(self.cache_path.exists())
 
-    def test_prefers_live_data_and_uses_latest_source_timestamp(self) -> None:
-        live_data = {
-            "schema": 3,
-            "benchmark_id": "deep-swe",
-            "source_updated_at": {
-                "codex": "2026-10-21T02:00:00Z",
-                "other": "2026-10-20T06:00:00Z",
-            },
-            "points": [{"model": "gpt-6-sol", "effort": "high", "iq": 98.6}],
-        }
+    def test_partial_sweep_resumes_next_wake_with_bounded_concurrency_and_drops_late_results(self) -> None:
+        cancelled = threading.Event()
+        release = threading.Event()
+        blocked = threading.Event()
+        lock = threading.Lock()
+        active = 0
+        maximum = 0
+        requests: list[tuple[str, str]] = []
+        errors: list[Exception] = []
 
-        radar = self.read_radar(
-            "", live_data=live_data, now="2026-10-21T03:00:00+00:00",
-        )
+        def respond(url: str, cancel_event: threading.Event, deadline: float) -> dict[str, object]:
+            nonlocal active, maximum
+            if "radar-bench-binding.json" in url:
+                return self.respond(url, cancel_event, deadline)
+            query = codex_usage_bridge.urllib.parse.parse_qs(codex_usage_bridge.urllib.parse.urlparse(url).query)
+            key = (query["model"][0], query["effort"][0])
+            with lock:
+                requests.append(key)
+                active += 1
+                maximum = max(maximum, active)
+                ordinal = len(requests)
+            try:
+                if ordinal > 1:
+                    blocked.set()
+                    release.wait(2)
+                return self.respond(url, cancel_event, deadline)
+            finally:
+                with lock:
+                    active -= 1
 
-        self.assertEqual(radar.updated, "10/21 10:00")
-        self.assertEqual(radar.models[0], codex_usage_bridge.RadarModel("6 Sol high", 986))
-        self.assertEqual(self.requested_urls, [codex_usage_bridge.CODEX_RADAR_LIVE_URL])
+        def refresh_until_cancelled() -> None:
+            try:
+                self.reader.refresh(cancelled)
+            except RuntimeError as error:
+                errors.append(error)
 
-    def test_marks_old_published_fallback_and_preserves_marker_on_wire(self) -> None:
-        data = {
-            "schema": 2,
-            "source_updated_at": "2026-10-01T23:00:27+08:00",
-            "points": [{"model": "gpt-5.6-sol", "effort": "high", "iq": 96.4}],
-        }
+        with mock.patch.object(self.reader, "_read_json", side_effect=respond):
+            worker = threading.Thread(target=refresh_until_cancelled)
+            worker.start()
+            try:
+                self.assertTrue(blocked.wait(2))
+                # Wait until the first accepted entry is visible, not merely
+                # until its HTTP response has been produced.
+                until = codex_usage_bridge.time.monotonic() + 2
+                while not self.reader._entries and codex_usage_bridge.time.monotonic() < until:
+                    cancelled.wait(0.005)
+                self.assertTrue(self.reader._entries)
+                accepted = set(self.reader._entries)
+                before_cancel = len(requests)
+                cancelled.set()
+            finally:
+                release.set()
+                worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIn("cancelled", str(errors[0]))
+        self.assertLessEqual(maximum, 3)
+        self.assertEqual(set(self.reader._entries), accepted)
+        self.assertEqual(len(requests), before_cancel)
+        self.assertFalse(self.cache_path.exists())
 
-        radar = self.read_radar("", data, now="2026-10-21T03:00:00+00:00")
+        resumed: list[tuple[str, str]] = []
 
-        self.assertEqual(radar.updated, "10/01 23:00 OLD")
-        self.assertEqual(
-            self.requested_urls,
-            [codex_usage_bridge.CODEX_RADAR_LIVE_URL, codex_usage_bridge.CODEX_RADAR_DATA_URL],
-        )
-        payload = codex_usage_bridge.UsageSnapshot(
-            host="Test", fetched_epoch=1, radar=radar,
-        ).wire_payload()
-        self.assertIn(",10/01 23:00 OLD,", payload)
+        def resume(url: str, cancel_event: threading.Event, deadline: float) -> dict[str, object]:
+            if "radar-bench-binding.json" not in url:
+                query = codex_usage_bridge.urllib.parse.parse_qs(codex_usage_bridge.urllib.parse.urlparse(url).query)
+                resumed.append((query["model"][0], query["effort"][0]))
+            return self.respond(url, cancel_event, deadline)
 
-    def test_generated_time_is_used_when_source_time_is_missing(self) -> None:
-        data = {
-            "generated_at": "2026-10-21T02:00:00Z",
-            "points": [{"model": "gpt-6-sol", "effort": "high", "iq": 98.6}],
-        }
+        with mock.patch.object(self.reader, "_read_json", side_effect=resume):
+            complete = self.reader.refresh(threading.Event())
+        self.assertEqual(len(json.loads(self.cache_path.read_text())["entries"]), 34)
+        self.assertFalse(accepted.intersection(resumed))
+        self.assertEqual(len(complete.models), 6)
+        self.assertTrue(self.cache_path.exists())
 
-        radar = self.read_radar("", live_data=data, now="2026-10-21T03:00:00+00:00")
-
-        self.assertEqual(radar.updated, "10/21 10:00")
-
-    def test_rejects_different_benchmark_before_published_fallback(self) -> None:
-        live_data = {
-            "benchmark_id": "other-benchmark",
-            "source_updated_at": "2026-10-21T02:00:00Z",
-            "points": [{"model": "gpt-6-sol", "effort": "high", "iq": 1}],
-        }
-        data = {
-            "source_updated_at": "2026-10-21T01:00:00Z",
-            "points": [{"model": "gpt-6-sol", "effort": "high", "iq": 98.6}],
-        }
-
-        radar = self.read_radar(
-            "", data=data, live_data=live_data, now="2026-10-21T03:00:00+00:00",
-        )
-
-        self.assertEqual(radar.models[0].score_tenths, 986)
-
-    def test_keeps_support_for_legacy_degradation_radar_markup(self) -> None:
-        page = """
-        <section class="model-iq model-iq-green">
-          <h2>降智雷达 <span>7月21日12:11更新</span></h2>
-          <button class="model-iq-score-chip">
-            <span>GPT-5 high</span>
-            <div class="model-iq-score-metrics"><strong>91.2</strong></div>
-          </button>
-        </section>
-        """
-
-        radar = self.read_radar(page)
-
-        self.assertEqual(radar.updated, "07/21 12:11")
-        self.assertEqual(
-            radar.models,
-            (codex_usage_bridge.RadarModel(name="5 high", score_tenths=912),),
-        )
+    def test_reads_gzip_compressed_bench_json(self) -> None:
+        body = gzip.compress(json.dumps(self.binding).encode("utf-8"))
+        with mock.patch.object(
+            codex_usage_bridge.urllib.request, "urlopen",
+            return_value=FakeResponse(body, {"Content-Encoding": "gzip"}),
+        ) as opened:
+            result = self.reader._read_json(
+                "https://example.test/binding", threading.Event(),
+                codex_usage_bridge.time.monotonic() + 5,
+            )
+        self.assertEqual(result, self.binding)
+        self.assertEqual(opened.call_args.args[0].get_header("Accept-encoding"), "gzip")
 
 
 class CodexRateLimitTests(unittest.TestCase):
@@ -299,7 +399,7 @@ class CodexRateLimitTests(unittest.TestCase):
             (-1, -1, 0, 70, 333),
         )
 
-    def test_usage5_payload_appends_source_status_after_legacy_five_hour_fields(self) -> None:
+    def test_usage6_payload_preserves_source_epochs_and_appends_radar_cache_flag(self) -> None:
         snapshot = codex_usage_bridge.UsageSnapshot(
             host="Test Mac",
             fetched_epoch=1787890000,
@@ -313,20 +413,35 @@ class CodexRateLimitTests(unittest.TestCase):
             vibe24_fetched_epoch=1787890001,
             vibe7_fetched_epoch=1787890002,
             vibe30_fetched_epoch=1787890003,
+            radar_fetched_epoch=1787889000,
             radar=codex_usage_bridge.RadarUsage(
                 updated="08/28 09:00",
                 models=(codex_usage_bridge.RadarModel("Sol high", 912),),
+                fetched_epoch=1787889000,
+                cached=True,
             ),
         )
 
         fields = snapshot.wire_payload().split(",")
 
-        self.assertEqual(fields[0], "USAGE5")
-        self.assertEqual(fields[-8:-6], ["75", "1787897794"])
-        self.assertEqual(fields[-6:], ["16", "1787890000", "1787890001", "1787890002", "1787890003", "0"])
+        self.assertEqual(fields[0], "USAGE6")
+        self.assertEqual(fields[-9:-7], ["75", "1787897794"])
+        self.assertEqual(fields[-7:], ["16", "1787890000", "1787890001", "1787890002", "1787890003", "1787889000", "1"])
 
 
 class MetricsCollectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.cache_dir.cleanup)
+        self.reader = codex_usage_bridge.RadarBenchReader(
+            Path(self.cache_dir.name) / "radar-cache.json"
+        )
+        reader_factory = mock.patch.object(
+            codex_usage_bridge, "RadarBenchReader", return_value=self.reader
+        )
+        reader_factory.start()
+        self.addCleanup(reader_factory.stop)
+
     def test_finds_bundled_cli_when_path_has_no_codex(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             candidate = Path(directory) / "ChatGPT.app/Contents/Resources/nested/codex"
@@ -409,7 +524,10 @@ class MetricsCollectionTests(unittest.TestCase):
         def read_radar(cancel_event: threading.Event) -> codex_usage_bridge.RadarUsage:
             if not release_radar.wait(2):
                 raise RuntimeError("test did not release radar")
-            return codex_usage_bridge.RadarUsage("10/22 12:00", (codex_usage_bridge.RadarModel("Sol", 900),))
+            return codex_usage_bridge.RadarUsage(
+                "10/22 12:00", (codex_usage_bridge.RadarModel("Sol", 900),),
+                fetched_epoch=200,
+            )
 
         def publish(snapshot: codex_usage_bridge.UsageSnapshot) -> None:
             progress.append(snapshot)
@@ -440,6 +558,49 @@ class MetricsCollectionTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(completed[0].pending_mask, 0)
         self.assertEqual(completed[0].radar_fetched_epoch, 200)
+
+    def test_full_radar_cache_is_published_immediately_without_radar_pending_bit(self) -> None:
+        collector = codex_usage_bridge.MetricsCollector()
+        collector.codex = mock.Mock()
+        collector.codex.read_usage_limits.return_value = (90, 10, 999, -1, 0)
+        cached = codex_usage_bridge.RadarUsage(
+            "10/21 10:00", (codex_usage_bridge.RadarModel("6.1 Sol high", 1000),),
+            fetched_epoch=100, cached=True,
+        )
+        core_ready = threading.Event()
+        release_radar = threading.Event()
+        progress: list[codex_usage_bridge.UsageSnapshot] = []
+
+        def read_radar(cancel_event: threading.Event) -> codex_usage_bridge.RadarUsage:
+            release_radar.wait(2)
+            return cached
+
+        def publish(snapshot: codex_usage_bridge.UsageSnapshot) -> None:
+            progress.append(snapshot)
+            if snapshot.pending_mask == 0:
+                core_ready.set()
+
+        with (
+            mock.patch.object(collector, "_vibe_config", return_value={"hostname": "test-host"}),
+            mock.patch.object(collector, "_read_vibe_period", return_value=codex_usage_bridge.PeriodUsage(1, 10)),
+            mock.patch.object(self.reader, "cached_usage", return_value=cached),
+            mock.patch.object(collector, "_read_codex_radar", side_effect=read_radar),
+            mock.patch.object(codex_usage_bridge.time, "time", return_value=200),
+            mock.patch("builtins.print"),
+        ):
+            worker = threading.Thread(target=lambda: collector.collect(on_progress=publish))
+            worker.start()
+            try:
+                self.assertTrue(core_ready.wait(2))
+                self.assertEqual(progress[0].pending_mask, 15)
+                self.assertEqual(progress[0].radar, cached)
+                self.assertEqual(progress[0].radar_fetched_epoch, 100)
+                self.assertTrue(all(not snapshot.pending_mask & 16 for snapshot in progress))
+                self.assertTrue(all(snapshot.radar_fetched_epoch == 100 for snapshot in progress))
+            finally:
+                release_radar.set()
+                worker.join(2)
+        self.assertFalse(worker.is_alive())
 
     def test_cancelled_refresh_drops_late_radar_and_returns_no_cached_values(self) -> None:
         collector = codex_usage_bridge.MetricsCollector()
